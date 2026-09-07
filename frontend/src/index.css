@@ -8,6 +8,16 @@
   text-rendering: optimizeLegibility;
 }
 
+.autogram-logo { display: inline-flex; align-items: center; gap: 10px; flex-shrink: 0; vertical-align: middle; color: #192d28; }
+.autogram-logo img { display: block; width: 38px; height: 38px; flex-shrink: 0; }
+.autogram-wordmark { font-size: 26px; font-weight: 650; letter-spacing: -1.2px; line-height: 1; }
+.autogram-wordmark-dot { color: #238e76; }
+.sidebar .autogram-logo, .autogram-logo.logo-inverse { color: #fbfcf9; }
+.autogram-logo.logo-inverse .autogram-wordmark-dot, .sidebar .autogram-wordmark-dot { color: #d4e6b6; }
+.autogram-logo.logo-small { gap: 6px; }
+.autogram-logo.logo-small img { width: 28px; height: 28px; }
+.autogram-logo.logo-small .autogram-wordmark { font-size: 19px; letter-spacing: -.8px; }
+
 body {
   @apply text-slate-900 antialiased;
   min-height: 100vh;

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { BrainCircuit, Mail, Lock, Loader2, LogIn, UserPlus, Target, ShieldCheck, Sparkles } from "lucide-react";
 import { api, auth } from "../api";
+import BrandLogo from "./BrandLogo";
 
 const VALUE_PROPS = [
   { icon: Target, title: "AI-matched roles", desc: "Every listing scored against your resume — semantic fit, skills, and ATS keywords." },
@@ -51,10 +52,7 @@ export default function AuthPage({ onAuthed, initialMode = "login" }) {
           }}
         />
         <div className="relative flex items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-white/15 ring-1 ring-white/20 backdrop-blur">
-            <BrainCircuit size={19} />
-          </div>
-          <span className="text-lg font-semibold tracking-tight">Autogram</span>
+          <Link to="/" aria-label="Autogram home"><BrandLogo className="logo-inverse" /></Link>
         </div>
 
         <div className="relative">
@@ -88,10 +86,7 @@ export default function AuthPage({ onAuthed, initialMode = "login" }) {
       <div className="flex flex-1 items-center justify-center bg-slate-50 px-4 py-12 lg:bg-white">
         <div className="w-full max-w-sm">
           <div className="mb-8 flex flex-col items-center text-center lg:hidden">
-            <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-brand-gradient shadow-xs">
-              <BrainCircuit size={22} className="text-white" />
-            </div>
-            <h1 className="text-xl font-semibold tracking-tight text-slate-900">Autogram</h1>
+            <Link to="/" className="mb-4" aria-label="Autogram home"><BrandLogo /></Link>
             <p className="mt-1 text-sm text-slate-500">
               Your resume, matched against the live job market.
             </p>

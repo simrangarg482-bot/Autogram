@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
+import BrandLogo from "./components/BrandLogo";
 import Landing from "./pages/Landing";
 import Home from "./pages/Home";
 import JobsAndMatches from "./pages/JobsAndMatches";
@@ -155,13 +156,7 @@ export default function App() {
       {/* Sidebar */}
       <aside className="sidebar fixed inset-y-0 left-0 z-40 hidden w-[272px] flex-col lg:flex">
         <div className="flex h-[76px] items-center gap-3 border-b border-white/[0.07] px-6">
-          <div className="brand-mark">
-            <Sparkles size={17} className="text-white" />
-          </div>
-          <div>
-            <span className="block text-[17px] font-semibold tracking-[-0.03em] text-white">autogram</span>
-            <span className="block text-[9px] font-semibold uppercase tracking-[0.2em] text-slate-500">Career OS</span>
-          </div>
+          <Link to="/" aria-label="Autogram home"><BrandLogo /></Link>
         </div>
 
         <nav className="flex-1 space-y-6 overflow-y-auto px-3 py-6">
@@ -228,10 +223,7 @@ export default function App() {
               {mobileMenuOpen ? <PanelLeftClose size={19} /> : <Menu size={19} />}
             </button>
             <div className="flex items-center gap-2 lg:hidden">
-              <div className="brand-mark !h-8 !w-8 !rounded-[10px]">
-                <Sparkles size={14} className="text-white" />
-              </div>
-              <span className="font-semibold tracking-tight text-slate-900">autogram</span>
+              <Link to="/" aria-label="Autogram home"><BrandLogo className="logo-small" /></Link>
             </div>
             <div className="hidden items-center gap-2 text-sm lg:flex">
               <span className="text-slate-400">Workspace</span>

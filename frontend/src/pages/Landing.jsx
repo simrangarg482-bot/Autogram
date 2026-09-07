@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { ArrowRight, ArrowUpRight, BriefcaseBusiness, Check, CheckCheck, ChevronRight, FileText, Fingerprint, Layers3, Menu, ScanText, ShieldCheck, Sparkles, Target, Upload, X } from "lucide-react";
 import "./landing.css";
 import NavMascot from "../components/NavMascot";
+import BrandLogo from "../components/BrandLogo";
 
 const STEPS = [
   { icon: Upload, title: "Upload your resume", text: "Start with your story. Bring your experience, skills, education, and career history together in one place." },
@@ -19,7 +20,7 @@ const FEATURES = [
 ];
 
 function Brand() {
-  return <Link to="/" className="landing-brand" aria-label="Autogram home"><span><Sparkles size={20} /></span>autogram<span className="brand-period">.</span></Link>;
+  return <Link to="/" className="inline-flex shrink-0" aria-label="Autogram home"><BrandLogo className="landing-logo" /></Link>;
 }
 
 function ProfilePreview({ compact = false }) {
