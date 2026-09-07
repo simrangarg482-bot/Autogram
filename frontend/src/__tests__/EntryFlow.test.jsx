@@ -26,7 +26,7 @@ beforeEach(() => {
 describe("public entry experience", () => {
   it("shows the landing page without requiring authentication or fetching private data", () => {
     open();
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Your career deserves more than manual applications.");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Paste a job link. Autogram fills the application.");
     expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
     expect(api.me).not.toHaveBeenCalled();
     expect(api.listResumes).not.toHaveBeenCalled();
