@@ -1,7 +1,8 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { ArrowRight, ArrowUpRight, BriefcaseBusiness, Check, CheckCheck, ChevronRight, FileText, Fingerprint, Layers3, Menu, ScanText, ShieldCheck, Sparkles, Target, Upload, X } from "lucide-react";
 import "./landing.css";
+import NavMascot from "../components/NavMascot";
 
 const STEPS = [
   { icon: Upload, title: "Upload your resume", text: "Start with your story. Bring your experience, skills, education, and career history together in one place." },
@@ -35,15 +36,30 @@ function ProfilePreview({ compact = false }) {
 }
 
 export default function Landing({ user }) {
+  const landingRef = useRef(null);
+  useEffect(() => {
+    if (!window.IntersectionObserver || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    const elements = landingRef.current.querySelectorAll(".section-intro, .step-card, .feature-card, .preview-section-heading, .dashboard-preview, .about-section, .final-cta-inner");
+    const observer = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (!entry.isIntersecting) return;
+        entry.target.classList.add("landing-revealed");
+        observer.unobserve(entry.target);
+      });
+    }, { threshold: 0.08 });
+    elements.forEach(element => observer.observe(element));
+    return () => observer.disconnect();
+  }, []);
   const [menuOpen, setMenuOpen] = useState(false);
   const destination = user ? "/dashboard" : "/signup";
   const cta = user ? "Open dashboard" : "Get Started";
   const navigation = <><a href="#how-it-works" onClick={() => setMenuOpen(false)}>How it works</a><a href="#features" onClick={() => setMenuOpen(false)}>Features</a><a href="#about" onClick={() => setMenuOpen(false)}>About</a></>;
-  return <div className="landing">
+  return <div ref={landingRef} className="landing">
     <a href="#landing-main" className="skip-link">Skip to content</a>
     <header className="landing-header">
       <div className="landing-nav"><Brand /><nav className="landing-links hidden md:flex" aria-label="Main navigation">{navigation}</nav><div className="flex items-center gap-3 sm:gap-5"><Link className="landing-signin hidden sm:block" to={user ? "/dashboard" : "/login"}>{user ? "Dashboard" : "Sign In"}</Link><Link to={destination} className="landing-button nav-cta">{cta}<ArrowUpRight size={15} /></Link><button className="btn-icon md:hidden" aria-label={menuOpen ? "Close navigation" : "Open navigation"} aria-expanded={menuOpen} aria-controls="landing-mobile-nav" onClick={() => setMenuOpen(!menuOpen)}>{menuOpen ? <X size={20} /> : <Menu size={20} />}</button></div></div>
       {menuOpen && <nav id="landing-mobile-nav" className="landing-mobile-nav" aria-label="Mobile navigation" onKeyDown={event => { if (event.key === "Escape") setMenuOpen(false); }}>{navigation}<Link to={user ? "/dashboard" : "/login"}>{user ? "Dashboard" : "Sign In"}</Link></nav>}
+      <NavMascot />
     </header>
 
     <main id="landing-main">

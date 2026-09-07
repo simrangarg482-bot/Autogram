@@ -1,6 +1,28 @@
 .landing { background: #fbfcf9; color: #192d28; overflow: clip; }
 .landing-container { width: min(1200px, calc(100% - 80px)); margin-inline: auto; }
 .landing-header { position: sticky; top: 0; z-index: 40; background: rgb(251 252 249 / .94); border-bottom: 1px solid #e5eae2; backdrop-filter: blur(16px); }
+.nav-mascot-lane { position: relative; height: 38px; max-width: 1280px; margin: -8px auto 0; padding-inline: 20px 55px; }
+.nav-mascot-track { position: relative; height: 38px; border-bottom: 1px solid #edf1e8; }
+.nav-mascot-traveler { position: absolute; left: 0; bottom: 0; width: 32px; height: 38px; }
+.nav-mascot-child { overflow: visible; }
+.nav-mascot-toggle { position: absolute; right: 17px; bottom: 5px; display: grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; color: #667d71; background: #eff4eb; }
+.nav-mascot-toggle:hover { background: #d5f2e9; color: #155c4e; }
+.mascot-leg { transform-origin: 21px 33px; }
+.mascot-arm { transform-origin: 21px 24px; }
+@keyframes mascotTravel { 0%, 4% { left: 0; } 46%, 54% { left: calc(100% - 32px); } 96%, 100% { left: 0; } }
+@keyframes mascotTurn { 0%, 49.9% { transform: scaleX(1); } 50%, 99.9% { transform: scaleX(-1); } 100% { transform: scaleX(1); } }
+@keyframes mascotStride { from { transform: rotate(-22deg); } to { transform: rotate(22deg); } }
+@keyframes mascotBounce { from { transform: translateY(0); } to { transform: translateY(-1.5px); } }
+@media (prefers-reduced-motion: no-preference) {
+  .nav-mascot-traveler { animation: mascotTravel 32s linear infinite; }
+  .nav-mascot-child { animation: mascotTurn 32s linear infinite; }
+  .mascot-body { animation: mascotBounce .32s ease-in-out infinite alternate; }
+  .mascot-leg-front, .mascot-arm-back { animation: mascotStride .42s ease-in-out infinite alternate; }
+  .mascot-leg-back, .mascot-arm-front { animation: mascotStride .42s ease-in-out infinite alternate-reverse; }
+}
+.mascot-paused *, .nav-mascot-lane:hover .nav-mascot-traveler, .nav-mascot-lane:hover .nav-mascot-child, .nav-mascot-lane:hover .mascot-body, .nav-mascot-lane:hover .mascot-leg, .nav-mascot-lane:hover .mascot-arm { animation-play-state: paused; }
+@media (prefers-reduced-motion: reduce) { .nav-mascot-toggle { display: none; } }
+@media (max-width: 767px) and (prefers-reduced-motion: no-preference) { .nav-mascot-traveler, .nav-mascot-child { animation-duration: 18s; } }
 .landing-nav { max-width: 1360px; margin: auto; height: 88px; padding: 0 40px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .landing-brand { display: inline-flex; align-items: center; gap: 9px; font-size: 24px; font-weight: 700; letter-spacing: -1.1px; }
 .landing-brand > span:first-child { display: grid; place-items: center; background: #16735f; color: white; width: 35px; height: 35px; border-radius: 11px; }
@@ -82,6 +104,27 @@
 .landing-footer > p { flex: 1; font-size: 11px; color: #738079; }
 .landing-footer > span, .landing-footer > a:last-child { display: inline-flex; align-items: center; gap: 6px; font-size: 10px; color: #738079; }
 @keyframes landingReveal { from { opacity: 0; translate: 0 15px; } to { opacity: 1; translate: 0 0; } }
+@keyframes landingFloat { 0%, 100% { translate: 0 0; } 50% { translate: 0 -8px; } }
+@keyframes landingFill { from { scale: 0 1; } to { scale: 1 1; } }
+@keyframes landingOrbit { to { rotate: 360deg; } }
+@media (prefers-reduced-motion: no-preference) {
+  .hero-copy > * { animation: landingReveal .7s ease backwards; }
+  .hero-copy > :nth-child(2) { animation-delay: .1s; }
+  .hero-copy > :nth-child(3) { animation-delay: .2s; }
+  .hero-copy > :nth-child(4) { animation-delay: .3s; }
+  .hero-copy > :nth-child(5) { animation-delay: .4s; }
+  .hero-preview { animation: landingReveal .8s ease both, landingFloat 7s ease-in-out 1s infinite; }
+  .hero-insight { animation: landingReveal .8s ease .3s backwards, landingFloat 8s ease-in-out 1.5s infinite; }
+  .hero-orbit::after { animation: landingOrbit 100s linear infinite; }
+  .hero-preview .preview-completion .bg-brand-500 { transform-origin: left; animation: landingFill 1.4s cubic-bezier(.22,1,.36,1) .6s backwards; }
+  .landing-revealed { animation: landingReveal .7s cubic-bezier(.22,1,.36,1) backwards; }
+  .step-card.landing-revealed:nth-child(2), .feature-card.landing-revealed:nth-child(3n + 2) { animation-delay: .08s; }
+  .step-card.landing-revealed:nth-child(3), .feature-card.landing-revealed:nth-child(3n + 3) { animation-delay: .16s; }
+  .landing-button svg, .feature-card > svg, .feature-card { transition: transform .25s ease, background .25s ease; }
+  .landing-button:hover svg { transform: translateX(3px); }
+  .feature-card:hover { background: #fff; }
+  .feature-card:hover > svg { transform: translateY(-3px) rotate(-5deg); }
+}
 @media (max-width: 1024px) { .landing-hero { gap: 35px; padding-block: 70px; } .hero-copy h1 { letter-spacing: -2px; } .hero-insight { margin-left: 10px; margin-right: 0; } .preview-body { padding: 18px; } .landing-links { gap: 20px; } }
 @media (max-width: 767px) { .landing-container { width: calc(100% - 40px); } .landing-nav { height: 74px; padding-inline: 20px; gap: 10px; } .landing-brand { font-size: 21px; gap: 7px; } .landing-brand > span:first-child { width: 30px; height: 30px; } .landing-button.nav-cta { padding: 10px 12px; gap: 7px; } .landing-hero { grid-template-columns: 1fr; gap: 40px; padding-block: 55px 45px; } .hero-copy h1 { font-size: clamp(42px, 8vw, 58px); max-width: 580px; } .hero-description { font-size: 14px; } .hero-visual { width: min(440px, 95%); margin: auto; } .hero-orbit { width: 110%; height: 470px; } .landing-principles { justify-content: flex-start; gap: 20px; } .landing-principles > p { width: 100%; } .landing-principles > span { font-size: 11px; } .landing-section { padding-block: 60px; } .section-intro { display: block; } .section-intro > p { margin-top: 20px; } .steps-grid, .features-grid { grid-template-columns: 1fr; } .step-card { padding: 25px; } .step-top { margin-bottom: 23px; } .step-connector { right: calc(50% - 10px); top: auto; bottom: -23px; transform: rotate(90deg); } .features-section { padding-block: 60px; } .feature-card { padding: 26px; } .dashboard-preview-content { grid-template-columns: 1fr; padding: 14px; gap: 16px; } .dashboard-preview-bar { padding: 16px; } .preview-opportunities { padding: 12px; } .about-section { grid-template-columns: 1fr; gap: 22px; padding-block: 45px; } .final-cta { padding-bottom: 45px; } .final-cta-inner { padding: 48px 20px; } .landing-footer { gap: 18px; } .landing-footer > p { flex-basis: 45%; } }
 @media (prefers-reduced-motion: reduce) { .hero-preview { animation: none; } .landing-button:hover, .step-card:hover { transform: none; } }
