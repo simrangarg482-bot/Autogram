@@ -76,7 +76,7 @@ export default function Applications({ toast }) {
           {loading ? "Loading your application history…" : `Every application the automation has ever touched — ${applications.length} total.`}
         </p>
         </div>
-        <Link to="/#apply-from-link" className="btn-primary">New application <ArrowRight size={15} /></Link>
+        <Link to="/dashboard#apply-from-link" className="btn-primary">New application <ArrowRight size={15} /></Link>
       </div>
 
       <div className="card overflow-hidden">
@@ -120,7 +120,7 @@ export default function Applications({ toast }) {
             <p className="font-medium text-slate-700">
               {applications.length === 0 ? "No applications yet" : "No applications match your filters"}
             </p>
-            {applications.length === 0 ? <Link to="/#apply-from-link" className="btn-primary mt-5">Start your first application <ArrowRight size={14} /></Link> : <button className="btn-ghost mt-5" onClick={() => { setSearch(""); setStatusFilter(""); }}>Clear filters</button>}
+            {applications.length === 0 ? <Link to="/dashboard#apply-from-link" className="btn-primary mt-5">Start your first application <ArrowRight size={14} /></Link> : <button className="btn-ghost mt-5" onClick={() => { setSearch(""); setStatusFilter(""); }}>Clear filters</button>}
             <p className="mt-1 max-w-sm text-xs text-slate-500">
               {applications.length === 0
                 ? 'Head to Home and use "Apply from a job link", or find a match on the Job Search page.'

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { BrainCircuit, Mail, Lock, Loader2, LogIn, UserPlus, Target, ShieldCheck, Sparkles } from "lucide-react";
 import { api, auth } from "../api";
 
@@ -8,8 +9,11 @@ const VALUE_PROPS = [
   { icon: ShieldCheck, title: "You stay in control", desc: "Choose your approval settings. Step in for verification and review anything that needs your input." },
 ];
 
-export default function AuthPage({ onAuthed }) {
-  const [mode, setMode] = useState("login"); // "login" | "signup"
+export default function AuthPage({ onAuthed, initialMode = "login" }) {
+  const mode = initialMode;
+  const navigate = useNavigate();
+  const location = useLocation();
+  const setMode = (next) => navigate(next === "signup" ? "/signup" : "/login", { state: location.state });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
@@ -34,7 +38,8 @@ export default function AuthPage({ onAuthed }) {
   }
 
   return (
-    <div className="flex min-h-screen bg-white">
+    <div className="relative flex min-h-screen bg-white">
+      <Link to="/" className="absolute right-5 top-5 z-10 text-xs font-semibold text-brand-700">← Back to Autogram</Link>
       {/* Brand / value-prop panel */}
       <div className="relative hidden w-[46%] max-w-xl flex-col justify-between overflow-hidden bg-brand-gradient px-12 py-12 text-white lg:flex">
         <div

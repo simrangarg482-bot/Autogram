@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
-import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
+import { Link, Navigate, NavLink, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import {
   CheckCircle2, AlertCircle, Info, X, LogOut, Loader2,
   Home as HomeIcon, Search, LayoutDashboard, UserCircle2, FileText, Settings as SettingsIcon,
@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
+import Landing from "./pages/Landing";
 import Home from "./pages/Home";
 import JobsAndMatches from "./pages/JobsAndMatches";
 import Applications from "./pages/Applications";
@@ -23,7 +24,7 @@ const NAV_GROUPS = [
   {
     label: "Workspace",
     links: [
-      { to: "/", label: "Home", icon: HomeIcon, end: true },
+      { to: "/dashboard", label: "Home", icon: HomeIcon, end: true },
       { to: "/search", label: "Job Search", icon: Search },
       { to: "/applications", label: "Applications", icon: LayoutDashboard },
       { to: "/agent", label: "Autonomous Agent", icon: Bot },
@@ -51,12 +52,14 @@ export default function App() {
   const [toasts, setToasts] = useState([]);
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const location = useLocation();
+  const navigate = useNavigate();
 
   useEffect(() => {
     setMobileMenuOpen(false);
     window.scrollTo(0, 0);
     const page = NAV_LINKS.find((item) => item.end ? location.pathname === item.to : location.pathname.startsWith(item.to));
-    document.title = `${page?.label || "Workspace"} · Autogram`;
+    const publicTitle = { "/": "Your career, intelligently connected", "/login": "Sign in", "/signup": "Create your account" };
+    document.title = `${publicTitle[location.pathname] || page?.label || "Workspace"} · Autogram`;
   }, [location.pathname]);
 
   useEffect(() => {
@@ -80,6 +83,7 @@ export default function App() {
     auth.clear();
     setUser(null);
     setResume(null);
+    navigate("/");
   }, []);
 
   // Restore session: validate stored token, then pull the user's latest resume
@@ -92,25 +96,28 @@ export default function App() {
     api.me()
       .then((me) => {
         setUser({ email: me.email });
-        return api.listResumes();
+        return api.listResumes().catch(() => null);
       })
       .then((r) => {
         const latest = r?.resumes?.[0];
         if (latest) setResume({ id: latest.resume_id, filename: latest.original_filename });
       })
-      .catch(() => auth.clear())
+      .catch(() => { auth.clear(); setUser(null); })
       .finally(() => setAuthChecking(false));
   }, []);
 
   useEffect(() => {
+    if (!user) return;
     const check = () => api.health().then(setHealth).catch(() => setHealth({ status: "down" }));
     check();
     const interval = setInterval(check, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [user]);
 
   async function handleAuthed(u) {
     setUser(u);
+    const destination = location.state?.from;
+    navigate(typeof destination === "string" && destination.startsWith("/") && !destination.startsWith("//") ? destination : "/dashboard", { replace: true });
     try {
       const r = await api.listResumes();
       const latest = r?.resumes?.[0];
@@ -121,6 +128,8 @@ export default function App() {
     } catch { /* fresh account, nothing to restore */ }
   }
 
+  if (location.pathname === "/") return <Landing user={user} />;
+
   if (authChecking) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-slate-50">
@@ -129,7 +138,10 @@ export default function App() {
     );
   }
 
-  if (!user) return <AuthPage onAuthed={handleAuthed} />;
+  if (location.pathname === "/login" || location.pathname === "/signup") {
+    return user ? <Navigate to="/dashboard" replace /> : <AuthPage key={location.pathname} initialMode={location.pathname === "/signup" ? "signup" : "login"} onAuthed={handleAuthed} />;
+  }
+  if (!user) return <Navigate to="/login" replace state={{ from: location.pathname + location.search + location.hash }} />;
 
   const healthColor =
     health?.status === "ok" ? "bg-emerald-500" : health?.status === "degraded" ? "bg-amber-500" : "bg-red-500";
@@ -228,7 +240,7 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <Link to="/#apply-from-link" className="btn-primary !py-2 text-xs">+ New application</Link>
+            <Link to="/dashboard#apply-from-link" className="btn-primary !py-2 text-xs">+ New application</Link>
             {resume && <div className="hidden items-center gap-2 rounded-full border border-emerald-200 bg-emerald-50 px-3 py-1.5 text-[11px] font-medium text-emerald-700 sm:flex"><CheckCircle2 size={13} /> Resume ready</div>}
             <button className="hidden items-center gap-2 rounded-xl border border-slate-200 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-700 shadow-xs sm:flex lg:hidden" onClick={logout} title="Log out">
               <span className="flex h-6 w-6 items-center justify-center rounded-lg bg-brand-50 font-bold text-brand-700">{user.email?.[0]?.toUpperCase()}</span>
@@ -252,7 +264,7 @@ export default function App() {
 
         <main id="main-content" tabIndex={-1} className="mx-auto min-w-0 w-full max-w-[1440px] flex-1 px-4 py-7 sm:px-8 lg:px-10 lg:py-9">
           <Routes>
-            <Route path="/" element={<Home user={user} resume={resume} toast={toast} />} />
+            <Route path="/dashboard" element={<Home user={user} resume={resume} toast={toast} />} />
             <Route path="/search" element={<JobsAndMatches resume={resume} setResume={setResume} toast={toast} />} />
             <Route path="/applications" element={<Applications toast={toast} />} />
             <Route path="/applications/:id" element={<ApplicationDetail toast={toast} />} />
@@ -262,7 +274,7 @@ export default function App() {
             <Route path="/profile" element={<Profile toast={toast} />} />
             <Route path="/resumes" element={<ResumeManagement toast={toast} />} />
             <Route path="/settings" element={<Settings toast={toast} />} />
-            <Route path="*" element={<div className="empty-state"><h1 className="page-title">Page not found</h1><p className="page-subtitle">Let’s get you back to your workspace.</p><Link to="/" className="btn-primary mt-6">Back to home</Link></div>} />
+            <Route path="*" element={<div className="empty-state"><h1 className="page-title">Page not found</h1><p className="page-subtitle">Let’s get you back to your workspace.</p><Link to="/dashboard" className="btn-primary mt-6">Back to dashboard</Link></div>} />
           </Routes>
         </main>
       </div>
