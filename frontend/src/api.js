@@ -76,6 +76,7 @@ async function request(path, options = {}) {
 export const api = {
   getWorkflow: () => request("/profile/workflow"),
   getProfileDraft: (documentId) => request(`/profile/documents/${documentId}/profile-draft`, { method: "POST" }),
+  applyResumeDraft: (documentId) => request(`/profile/documents/${documentId}/apply-resume-draft`, { method: "POST" }),
   health: () => request("/health"),
 
   // Auth
@@ -93,6 +94,18 @@ export const api = {
       body: new URLSearchParams({ username: email, password }),
     }),
   me: () => request("/auth/me"),
+  forgotPassword: (email) =>
+    request("/auth/forgot-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email }),
+    }),
+  resetPassword: (token, newPassword) =>
+    request("/auth/reset-password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token, new_password: newPassword }),
+    }),
 
   // Resume pipeline
   listResumes: () => request("/resumes"),

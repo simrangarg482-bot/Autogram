@@ -59,6 +59,7 @@ from app.services import (
     trust_level_repository,
 )
 from app.services.event_bus import publish_application_event
+from app.workers.dispatch import dispatch_application_run
 from automation.applications import verification_channel
 from automation.applications.application_flow_manager import (
     ApplicationFlowManager,
@@ -69,6 +70,7 @@ from automation.applications.application_flow_manager import (
     request_stop,
     submit_open_review_session,
 )
+from automation.coordination import control, lease
 from automation.ats.detector import FALLBACK_ATS, detect_ats_for_url
 from automation.ats.registry import get_adapter_class
 from automation.forms.answer_engine import ApplicationAnswerEngine, is_decoy_field
@@ -353,8 +355,12 @@ def start_application(
         )
 
     if body.source == "server_automation":
-        background_tasks.add_task(
-            _run_application, application.application_id, resume_document_id, body.job_description,
+        # Phase 2c/2f: queued to the worker pool when CELERY_BROKER_URL is
+        # set (autopilot AND copilot runs alike, since 2f), otherwise run
+        # in-process via BackgroundTasks (unchanged). The run body
+        # (`_run_application`) is identical either way.
+        dispatch_application_run(
+            background_tasks, application.application_id, resume_document_id, body.job_description,
         )
     else:
         # source == "browser_extension": there is no server-side Playwright
@@ -570,31 +576,33 @@ def review_application_question(
     return question
 
 
-@router.post("/{application_id}/approve", response_model=ApplicationApprovalResult)
-def approve_application(
-    application_id: str,
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    """Approves final submission for a `copilot_review` application (§7/§8):
-    replays a submit click against the exact browser/page the run left open
-    (`submit_open_review_session` — the SAME confirmation logic the
-    `AUTO_SUBMIT` decision path uses, so the two can never disagree about
-    what counts as "submitted"), persists the result, and logs an audit
-    entry either way."""
-    application = _get_owned_application(db, application_id, user)
-    if application.status != "copilot_review":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Application is '{application.status}', not ready for approval (must be copilot_review).",
-        )
+def apply_copilot_approval(db: Session, application_id: str) -> ApplicationApprovalResult | None:
+    """Replays a submit click against the exact browser/page a `copilot_review`
+    run left open (`submit_open_review_session` — the SAME confirmation logic
+    the `AUTO_SUBMIT` decision path uses, so the two can never disagree about
+    what counts as "submitted"), persists the result, and logs an audit entry.
 
-    outcome = submit_open_review_session(application.application_id)
+    Shared by two callers that can never be allowed to disagree about what
+    "approved" does to the row: `approve_application`'s same-process fast path
+    below, and the worker's cross-process approval watcher
+    (`app/workers/runtime.py::_watch_for_copilot_approval`, Phase 2f) once it
+    consumes an `approve` signal deposited by a DIFFERENT API replica than the
+    one that owns this run's browser.
+
+    The actor for the audit entry is always the application's own owner —
+    both callers only ever act on a signal/request that `_get_owned_application`
+    or the original `POST /approve` call already authorized for this user, so
+    there's no separate "who clicked approve" to thread through here.
+
+    Returns `None` if there is no open review session for this application at
+    all in THIS process (already closed, timed out, or never left one open) —
+    callers use that to distinguish "nothing to approve" from a result."""
+    application = application_repository.get_by_id(db, application_id)
+    if application is None:
+        return None
+    outcome = submit_open_review_session(application_id)
     if outcome is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No open review session found for this application — it may have already timed out or closed.",
-        )
+        return None
     status, error = outcome
     application.status = status
     application.failure_reason = error if status != "applied" else None
@@ -604,8 +612,8 @@ def approve_application(
     db.commit()
 
     _record_audit_event(
-        db, application_id=application.application_id, user_id=user.user_id,
-        event_type="human_approved", actor=user.user_id, metadata={"result_status": status},
+        db, application_id=application_id, user_id=application.user_id,
+        event_type="human_approved", actor=application.user_id, metadata={"result_status": status},
     )
     message = {
         "applied": "Submission confirmed.",
@@ -613,6 +621,55 @@ def approve_application(
         "failed": error or "Could not submit — the submit control could not be clicked.",
     }.get(status, "Unknown outcome.")
     return ApplicationApprovalResult(status=status, message=message)
+
+
+@router.post("/{application_id}/approve", response_model=ApplicationApprovalResult)
+def approve_application(
+    application_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Approves final submission for a `copilot_review` application (§7/§8).
+
+    Same-process fast path (no broker, or this replica happens to be the one
+    that ran the automation): the browser is open right here, so
+    `apply_copilot_approval` replays the submit click and returns the
+    confirmed result immediately — unchanged from before Phase 2f.
+
+    Cross-worker path (Phase 2f): the browser isn't open in this process, but
+    a worker's Redis lease says the run is still alive elsewhere. This
+    deposits an `approve` signal (`automation.coordination.control`) for that
+    worker to pick up on its next poll and returns a `copilot_review` status
+    telling the caller to check back — the worker performs the exact same
+    `apply_copilot_approval` write once it consumes the signal
+    (`app/workers/runtime.py::_watch_for_copilot_approval`), so the two paths
+    can never disagree about what counts as approved."""
+    application = _get_owned_application(db, application_id, user)
+    if application.status != "copilot_review":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Application is '{application.status}', not ready for approval (must be copilot_review).",
+        )
+
+    # Same-process fast path: `apply_copilot_approval` returns None when THIS
+    # process has no open review session for this run — the common case in a
+    # multi-replica deployment, where the browser is almost always on some
+    # other worker — and only then do we fall through to the cross-worker
+    # signal below.
+    result = apply_copilot_approval(db, application_id)
+    if result is not None:
+        return result
+
+    if not lease.is_held("application", application_id):
+        raise HTTPException(
+            status_code=409,
+            detail="No open review session found for this application — it may have already timed out or closed.",
+        )
+    control.send_signal("application", application_id, "approve")
+    return ApplicationApprovalResult(
+        status="copilot_review",
+        message="Approval requested — this run is on another worker; check back in a few seconds for the result.",
+    )
 
 
 @router.post("/{application_id}/verification-code", response_model=ApplicationApprovalResult)
@@ -1093,6 +1150,12 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             adapter_cls=adapter_cls,
             profile=profile,
             resume_document=resume_document,
+            # Same optional caller-supplied hint `ApplicationAnswerEngine` above
+            # already got — reused, not re-fetched, for cover-letter generation
+            # (automation/applications/cover_letter.py). `None` (no hint given)
+            # means a cover-letter field found on the page is simply left
+            # unfilled rather than inventing a job description for it.
+            job_description=job_description,
             autopilot_enabled=application.autopilot_enabled,
             # Copilot mode (autopilot off) is the "a human reviews and
             # submits" path — run visibly and leave the browser open at the

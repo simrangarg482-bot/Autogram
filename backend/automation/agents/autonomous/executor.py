@@ -41,7 +41,7 @@ from automation.agents.autonomous.actions import ActionResult, AgentAction
 from automation.agents.autonomous.combobox_verify import verify_combobox_commit
 from automation.agents.autonomous.observer import observe_page
 from automation.agents.autonomous.page_validation import detect_error_page
-from automation.applications.page_navigator import capture_page_signature, wait_for_page_settled
+from automation.applications.page_navigator import advance_to_next_page, capture_page_signature, wait_for_page_settled
 from automation.utils.element_actions import safe_click
 from automation.utils.human_input import human_type
 
@@ -69,6 +69,7 @@ SENSITIVE_FIELD_PATTERNS = [
     r"disabilit", r"criminal", r"felony", r"convict", r"background\s*check",
     r"social\s*security", r"\bssn\b", r"i\s*certify", r"i\s*declare",
     r"legally\s*binding", r"under\s*penalty", r"date\s*of\s*birth", r"\bdob\b",
+    r"arbitrat", r"\bagreement\b", r"\bconsent\b", r"\bai\s*policy\b",
 ]
 _SENSITIVE_RE = re.compile("|".join(SENSITIVE_FIELD_PATTERNS), re.IGNORECASE)
 
@@ -254,6 +255,27 @@ class ActionExecutor:
     def _do_click(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
         before = self._safe_signature()
+        if self._current_semantic_action in ("NEXT", "CONTINUE", "SAVE_AND_CONTINUE", "REVIEW"):
+            outcome = advance_to_next_page(self.page, locator, before=before)
+            error = detect_error_page(self.page)
+            if error is not None:
+                return ActionResult(
+                    False, "click", f"Step navigation reached an error page: {error.detail}",
+                    verified=False, result_code="ERROR_PAGE", postcondition=error.code,
+                )
+            logger.info(
+                "Application step action=%s advanced=%s fields_before=%d fields_after=%d validation_errors=%d",
+                self._current_semantic_action, outcome.advanced,
+                outcome.before.control_count, outcome.after.control_count, len(outcome.validation_errors),
+            )
+            detail = outcome.reason
+            if outcome.validation_errors:
+                detail += ": " + "; ".join(outcome.validation_errors)
+            return ActionResult(
+                outcome.advanced, "click", detail, verified=outcome.advanced,
+                result_code="ACTION_SUCCEEDED" if outcome.advanced else "STEP_NOT_ADVANCED",
+                postcondition="application step changed" if outcome.advanced else "form did not advance",
+            )
         ok = safe_click(locator, self.page)
         if not ok:
             return ActionResult(False, "click", "Click did not succeed", verified=False)
@@ -453,8 +475,55 @@ class ActionExecutor:
                 blocked_reason="upload_path_not_allowed",
             )
         locator = _locator_for_ref(self.page, action.element_ref)
-        locator.set_input_files(action.file_path)
+        file_input = self._resolve_file_input(locator)
+        if file_input is None:
+            return ActionResult(
+                success=False, action_type="upload_file",
+                detail=(
+                    f"Element ref {action.element_ref} is not a file input, and no unique "
+                    "<input type=\"file\"> could be found near it to use instead."
+                ),
+            )
+        file_input.set_input_files(action.file_path)
         return ActionResult(True, "upload_file", f"Uploaded {action.file_path} to element ref {action.element_ref}")
+
+    def _resolve_file_input(self, locator):
+        """`upload_file`'s target ref often resolves to a STYLED BUTTON, not
+        the real `<input type="file">` — most ATS forms (Greenhouse included)
+        hide the native input and show a clickable control in its place, and
+        the DOM annotation step (`observer.py`) only tags VISIBLE elements, so
+        the hidden input never gets a ref of its own for the model to target.
+
+        Tries the ref as given first (covers a page that doesn't hide it),
+        then falls back to the nearest `<input type="file">` in the DOM: an
+        ancestor container's descendant if exactly one exists there (keeps two
+        separate upload fields, e.g. resume + cover letter, from colliding),
+        else the page's only one if there's exactly one on the whole page.
+        Returns None — a clear "nothing safe to do" — rather than guessing
+        among several candidates.
+        """
+        try:
+            if locator.evaluate("el => el.tagName") == "INPUT":
+                return locator
+        except Exception:  # noqa: BLE001 - detached/gone element, fall through to search
+            pass
+        scoped = locator.locator(
+            "xpath=ancestor::*[self::form or self::fieldset "
+            "or contains(@class,'upload') or contains(@class,'attach')][1]"
+            "//input[@type='file']"
+        )
+        try:
+            if scoped.count() == 1:
+                return scoped.first
+        except Exception:  # noqa: BLE001
+            pass
+        page_wide = self.page.locator("input[type='file']")
+        try:
+            if page_wide.count() == 1:
+                return page_wide.first
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     def _do_extract_text(self, action: AgentAction) -> ActionResult:
         if action.element_ref is not None:

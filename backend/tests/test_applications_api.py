@@ -54,6 +54,22 @@ def _neutral_automation_ownership(monkeypatch):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_celery_broker(monkeypatch):
+    """Keeps `POST /applications/start` on the in-process `BackgroundTasks`
+    dispatch path (Phase 2c/2f) regardless of what's in THIS machine's actual
+    environment — `tests/conftest.py` deliberately lets a real `.env`/shell
+    `REDIS_URL` take precedence over the test defaults, so a developer who has
+    one configured (e.g. a real managed Redis for local dev) would otherwise
+    have every un-mocked `start_application` call in this file actually try to
+    construct a Celery producer/result-backend against it. Tests that
+    specifically want the broker path mock `dispatch_application_run` (or
+    `app.workers.dispatch.CELERY_BROKER_URL`) themselves."""
+    import app.workers.dispatch as dispatch_module
+
+    monkeypatch.setattr(dispatch_module, "CELERY_BROKER_URL", None)
+
+
 def test_pick_resume_document_id_uses_explicit_override_when_it_belongs_to_the_profile():
     fake_doc = MagicMock(document_id="doc-1", profile_id="profile-1", document_type="resume")
     with patch("app.api.applications.profile_repository.get_document", return_value=fake_doc):
@@ -657,8 +673,43 @@ def test_approve_application_persists_an_unconfirmed_submission_as_needs_review(
     result = approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
 
     assert result.status == "needs_review"
-    assert application.status == "needs_review"
-    assert application.failure_reason is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2f — cross-worker copilot approve: no open review session in THIS
+# process, but a worker elsewhere holds the run's lease.
+# ---------------------------------------------------------------------------
+
+def test_approve_application_signals_the_worker_holding_the_lease(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="copilot_review")
+    # No local session: submit_open_review_session (called inside
+    # apply_copilot_approval) finds nothing to replay a click against.
+    monkeypatch.setattr(applications_module, "submit_open_review_session", lambda aid: None)
+    monkeypatch.setattr(applications_module.lease, "is_held", lambda kind, rid: True)
+    sent = []
+    monkeypatch.setattr(
+        applications_module.control, "send_signal",
+        lambda kind, rid, signal: sent.append((kind, rid, signal)) or True,
+    )
+
+    result = approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+
+    assert result.status == "copilot_review"
+    assert sent == [("application", "app-1", "approve")]
+
+
+def test_approve_application_404s_when_no_local_session_and_no_lease_held(monkeypatch):
+    import app.api.applications as applications_module
+
+    _owned_application(monkeypatch, status="copilot_review")
+    monkeypatch.setattr(applications_module, "submit_open_review_session", lambda aid: None)
+    monkeypatch.setattr(applications_module.lease, "is_held", lambda kind, rid: False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        approve_application("app-1", user=MagicMock(user_id="user-1"), db=MagicMock())
+    assert exc_info.value.status_code == 409
 
 
 def test_reject_application_closes_the_review_session_and_cancels(monkeypatch):

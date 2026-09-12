@@ -12,7 +12,17 @@ Rules you must follow strictly:
 - If a field isn't present in the resume, leave it null or as an empty list. Do not fill in placeholders.
 - "skills" = skills explicitly listed by the candidate (e.g. a Skills section, or clearly named tools/languages).
 - "inferred_skills" = skills you can reasonably infer from experience descriptions (e.g. "built REST APIs in Django" implies Python, Django, REST) — keep these SEPARATE from explicit skills.
+- "skill_categories" classifies EVERY skill/technology/tool named anywhere in the resume (Skills section, experience descriptions, projects) into exactly ONE of these six categories — never dump everything into "technical_skills":
+  - "programming_languages": actual programming or query languages only (e.g. Python, JavaScript, TypeScript, C++, Java, SQL).
+  - "frameworks": frameworks and libraries (e.g. React, Next.js, FastAPI, Django, Flask, LangChain, LangGraph).
+  - "tools": developer tools, platforms, cloud providers, IDEs, and utilities (e.g. Git, GitHub, Docker, Kubernetes, Postman, VS Code, Azure, AWS).
+  - "technical_skills": technical concepts or domains that are NOT themselves a language, framework, or tool (e.g. RAG, REST APIs, Microservices, Machine Learning, NLP, Generative AI, Data Structures).
+  - "soft_skills": interpersonal/professional skills (e.g. Communication, Leadership, Teamwork, Problem Solving).
+  - "certifications": ONLY actual named professional certifications the candidate holds (e.g. "AWS Certified Solutions Architect", "PMP") — a plain technology name is never a certification, even one people commonly get certified in.
+  Put each item in exactly one category (no duplicates across categories) unless the resume genuinely uses the same term in two distinct senses. Never invent a skill that isn't in the text.
 - "achievements" = quantified or notable accomplishments within a role, separate from the general description.
+- "linkedin_url"/"github_url"/"portfolio_url" = only if a literal URL (or handle clearly identifying one of these) appears in the text — never construct or guess one from a name.
+- "professional_summary" = the candidate's own summary/objective section, copied as written — never a summary you compose yourself from their experience. Leave null if the resume has no such section.
 - Compute nothing yourself except total_years_experience, which you should estimate from the date ranges given.
 - Output ONLY valid JSON matching the schema. No markdown fences, no preamble, no explanation text.
 """
@@ -24,9 +34,21 @@ Respond with ONLY a JSON object with this exact shape (use null/[] for missing d
   "email": string or null,
   "phone": string or null,
   "location": string or null,
+  "linkedin_url": string or null,
+  "github_url": string or null,
+  "portfolio_url": string or null,
+  "professional_summary": string or null,
   "total_years_experience": number or null,
   "skills": [string],
   "inferred_skills": [string],
+  "skill_categories": {
+    "programming_languages": [string],
+    "frameworks": [string],
+    "tools": [string],
+    "technical_skills": [string],
+    "soft_skills": [string],
+    "certifications": [string]
+  },
   "experience": [
     {
       "company": string or null,

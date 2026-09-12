@@ -15,18 +15,15 @@ Design: two implementations behind one abstract base class —
   - `S3StorageBackend` — writes to any S3-compatible object store (AWS S3,
     Cloudflare R2, MinIO). Selected via `STORAGE_BACKEND=s3`.
 
-Known boundary (flagged deliberately, not hidden): `local_path()` gives a
-caller a real filesystem path for a stored object regardless of backend (a
-no-op for Local, a temp-file download for S3) — this is what a caller that
-needs a real path on disk should use. Two existing call sites still read
-`record.stored_path` directly instead of going through this: pdfplumber/
-python-docx in `app/services/text_extraction.py`, and Playwright's file input
-in `automation/ats/base.py::upload_resume()`. Both need a real local path and
-are NOT yet routed through `local_path()` — that rewiring is the explicit
-next step before `STORAGE_BACKEND=s3` is safe to run in an environment that
-also does text extraction or browser automation. Tracked as follow-up in
-PHASE2_ARCHITECTURE.md Initiative 4. Save/delete are fully correct under S3
-today; those two specific reads are the gap.
+`local_path()` gives a caller a real filesystem path for a stored object
+regardless of backend (a no-op for Local, a temp-file download for S3) — this
+is what a caller that needs a real path on disk should use. Phase 3
+(PLATFORM_ROADMAP.md) rewired the two call sites that used to read
+`record.stored_path` directly instead: pdfplumber/python-docx in
+`app/services/text_extraction.py::extract_text`, and Playwright's file input
+in `automation/ats/base.py::ATSAdapter.upload_resume`. Both now go through
+`local_path()`, so `STORAGE_BACKEND=s3` is safe for text extraction and
+browser automation, not just save/delete.
 """
 
 from __future__ import annotations

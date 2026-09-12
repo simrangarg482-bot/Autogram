@@ -133,6 +133,13 @@ class FakeLocator:
         # Same attribute as `fill` so upload assertions read the same way.
         self.filled_with = path
 
+    def evaluate(self, script):
+        # `_resolve_file_input`'s fast path: every ref in this module's tests
+        # stands in for an ordinary `<input type="file">`, never a styled
+        # button — that fallback search is covered separately in
+        # `test_autonomous_executor.py`.
+        return "INPUT"
+
 
 class FakePage:
     def __init__(self):

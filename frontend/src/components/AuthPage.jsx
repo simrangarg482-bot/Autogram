@@ -30,7 +30,7 @@ export default function AuthPage({ onAuthed, initialMode = "login" }) {
         ? await api.signup(email, password)
         : await api.login(email, password);
       auth.setToken(r.access_token);
-      onAuthed({ email: r.email });
+      onAuthed({ email: r.email, isNewSignup: mode === "signup" });
     } catch (err) {
       setError(err.message);
     } finally {
@@ -127,6 +127,14 @@ export default function AuthPage({ onAuthed, initialMode = "login" }) {
                   value={password} onChange={(e) => setPassword(e.target.value)}
                   autoComplete={mode === "signup" ? "new-password" : "current-password"} />
               </div>
+
+              {mode === "login" && (
+                <div className="text-right">
+                  <Link to="/forgot-password" className="text-xs font-medium text-brand-600 hover:text-brand-700">
+                    Forgot password?
+                  </Link>
+                </div>
+              )}
 
               {error && (
                 <p role="alert" className="animate-fade-up rounded-lg border border-red-200 bg-red-50 px-3.5 py-2.5 text-xs text-red-700">

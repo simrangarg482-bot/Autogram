@@ -4,6 +4,7 @@ python-multipart
 pydantic
 pdfplumber
 python-docx
+markitdown[pdf,docx]   # primary resume-extraction engine (see app/services/text_extraction.py)
 sqlalchemy
 openai
 python-dotenv
@@ -31,7 +32,12 @@ playwright            # Phase 2: browser automation engine (automation/browser/*
 # After installing, download the browser binary once:
 #   playwright install chromium
 
-# --- Auto-apply platform (Phase 4+, not yet wired up — see ARCHITECTURE.md) ---
-# redis               # Phase 4: apply-job queue
-# celery              # Phase 4: async worker (or arq, still under evaluation)
+# --- Redis (Phase 1 — shared rate limiter + cross-replica event bus) ---
+# Optional at runtime (falls back to in-process), REQUIRED for multi-replica.
+redis>=5,<6
+
+# --- Apply-job worker (Phase 2 — automation/worker/) ---
+# The worker process needs a broker (REDIS_URL) to run; the API imports the
+# task module but only enqueues, so celery is a plain runtime dep either way.
+celery>=5.3,<6
 # langgraph           # Phase 6: AI agent orchestration layer aws ecr lamda

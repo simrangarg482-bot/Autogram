@@ -61,8 +61,10 @@ from typing import Any
 from playwright.sync_api import Error as PlaywrightError, Locator
 
 from app.core.crypto import decrypt_field
+from app.services.storage import get_storage_backend
 from automation.browser.selectors import (
     dismiss_overlays,
+    find_cover_letter_file_input,
     find_file_upload_input,
     find_next_button,
     find_page_heading,
@@ -70,6 +72,7 @@ from automation.browser.selectors import (
     find_unfilled_required_field_locators,
     find_upload_trigger_button,
     looks_like_review_page,
+    resolve_form_root,
 )
 from automation.forms.answer_engine import (
     DETERMINISTIC_CONFIDENCE,
@@ -114,6 +117,12 @@ _AUTOMATION_CANDIDATE_ATTR = "data-automation-candidate"
 # matching, none of which want it. `_normalize_text` in field_mapper.py strips
 # a trailing ASCII asterisk only, so these need handling here too.
 _REQUIRED_MARKER_CHARS = "*✱＊∗﹡·•"
+
+# A free-text box asking for a cover letter (e.g. Workday's "Cover Letter"
+# textarea) — checked against both the field's own name/id and whatever
+# `_question_text_for` reads as its label/ARIA name. Generic hints, not any
+# one company's field naming — see `find_cover_letter_text_field` below.
+COVER_LETTER_TEXT_HINTS = ["cover letter", "coverletter", "cover_letter"]
 
 
 def _strip_required_marker(text: str) -> str:
@@ -208,7 +217,18 @@ class FieldFillResult:
     populated whenever `filled` is `False` because the field-handler
     pipeline actually tried and couldn't confirm the value stuck (as
     opposed to "there was nothing to fill" or "this was never this pass's
-    job to answer", which stay `None`)."""
+    job to answer", which stay `None`).
+
+    `unfilled_reason` (also optional/backward-compatible) is the machine-
+    readable counterpart, for `automation.applications.application_state`:
+    `"no_answer_available"` (the answer/vision engine found nothing to say),
+    `"low_confidence"` (an answer existed but wasn't trusted enough to type
+    in — see `ANSWER_REVIEW_CONFIDENCE_THRESHOLD`), or `"fill_failed"` (an
+    answer was typed but the field handler couldn't verify it stuck — see
+    `failure` for the detail). `None` when `filled` is `True`, or for a
+    fill path that predates this distinction (e.g. `upload_resume`) — those
+    still report correctly via `filled`/`failure`, just without this extra
+    classification."""
 
     field_key: str
     profile_path: str | None
@@ -216,6 +236,7 @@ class FieldFillResult:
     confidence: float
     filled: bool
     failure: FieldFailure | None = None
+    unfilled_reason: str | None = None
 
 
 @dataclass
@@ -259,6 +280,10 @@ class ATSAdapter(ABC):
         answer_engine: ApplicationAnswerEngine | None = None,
     ):
         self.page = page
+        # Cache for the `form_root` property below — reset once per page by
+        # `ApplicationFlowManager._process_page` (`reset_form_root_cache`),
+        # not recomputed on every access within that same page.
+        self._form_root_cache: Any = None
         self.profile = profile
         self.resume_document = resume_document
         # Phase 6: optional. `None` (the default) preserves the exact
@@ -321,11 +346,11 @@ class ATSAdapter(ABC):
         """The control that advances to the next page, or `None` on the last
         one. Generic default: a "Next"/"Continue"/"Save and Continue" button
         that isn't inside a cookie banner (see `find_next_button`)."""
-        return find_next_button(self.page)
+        return find_next_button(self.form_root)
 
     def find_submit_control(self) -> Locator | None:
         """The control that submits the completed application, or `None`."""
-        return find_submit_button(self.page)
+        return find_submit_button(self.form_root)
 
     def is_final_page(self) -> bool:
         """Whether the application has reached its last page — the review or
@@ -342,12 +367,12 @@ class ATSAdapter(ABC):
         """Whether this page is showing the application back for a final check
         before submission. Informational — it sharpens the run log and the
         handoff message; `is_final_page` is what actually stops the loop."""
-        return looks_like_review_page(self.page)
+        return looks_like_review_page(self.form_root)
 
     def page_label(self) -> str:
         """What a human would call the current page ("My Experience"), for the
         run log. `""` when the page has no heading of its own."""
-        return find_page_heading(self.page)
+        return find_page_heading(self.form_root)
 
     def dismiss_distractions(self) -> list[str]:
         """Closes cookie/consent/chat overlays that would otherwise intercept
@@ -357,6 +382,38 @@ class ATSAdapter(ABC):
     # ------------------------------------------------------------------
     # Shared helpers — concrete, available to every subclass
     # ------------------------------------------------------------------
+
+    @property
+    def form_root(self):
+        """The right root to scan/fill FIELDS against — see
+        `automation.browser.selectors.resolve_form_root`. `self.page` itself
+        for every platform that renders its form directly (unaffected by
+        this existing); a same-origin content `<iframe>` for a platform
+        that doesn't (iCIMS, confirmed live).
+
+        Cached for the duration of one PAGE rather than recomputed on every
+        access: `resolve_form_root` scans every frame on the page (a real
+        cost on a page with several iframes, e.g. iCIMS's content frame
+        alongside hCaptcha's), and this property is read many times while
+        processing a single page (the label sweep, the name/placeholder
+        sweep, résumé/cover-letter upload, navigation control lookup, ...).
+        `ApplicationFlowManager._process_page` calls
+        `reset_form_root_cache()` once at the start of every page, so a
+        later page of the same multi-page application that switches between
+        rendering directly and rendering inside an iframe is still resolved
+        fresh — never stale across a page boundary, only reused within one."""
+        if self._form_root_cache is None:
+            self._form_root_cache = resolve_form_root(self.page)
+        return self._form_root_cache
+
+    def reset_form_root_cache(self) -> None:
+        """Forces the next `form_root` access to re-resolve rather than
+        reuse a value cached from a previous page. Called once per page by
+        `ApplicationFlowManager._process_page`, before any field scanning
+        happens on it — never mid-page, which is what keeps `form_root`
+        stable for the whole page while still never going stale across a
+        page transition."""
+        self._form_root_cache = None
 
     @property
     def phone(self) -> str | None:
@@ -406,7 +463,16 @@ class ATSAdapter(ABC):
             return False
 
         field = describe_field(upload_input, label="resume_upload", page=self.page)
-        outcome = fill_field(field, self.resume_document.stored_path, context=self._fill_context())
+        # `stored_path` is whatever `StorageBackend.save()` returned — a real
+        # local path under `STORAGE_BACKEND=local`, an `s3://` locator under
+        # `=s3`. `set_input_files()` (inside `fill_field`, for a file input)
+        # needs an actual file on disk, so this always goes through
+        # `local_path()` (a no-op locally; a temp download under S3, cleaned
+        # up the moment the `with` exits — fine, since `fill_field` reads it
+        # synchronously right here) — see
+        # `app/services/storage/base.py`'s module docstring, Phase 3.
+        with get_storage_backend().local_path(self.resume_document.stored_path) as local_path:
+            outcome = fill_field(field, local_path, context=self._fill_context())
         if outcome.filled:
             logger.info("%s: resume uploaded (%s).", self.name, outcome.actual_value or self.resume_document.original_filename)
         else:
@@ -419,11 +485,11 @@ class ATSAdapter(ABC):
         it behind an "Attach"/"Upload" trigger. `None` when this page has no
         upload field at all (a later step of a multi-step form, a posting that
         doesn't ask for a résumé)."""
-        upload_input = find_file_upload_input(self.page)
+        upload_input = find_file_upload_input(self.form_root)
         if upload_input is not None:
             return upload_input
 
-        trigger = find_upload_trigger_button(self.page)
+        trigger = find_upload_trigger_button(self.form_root)
         if trigger is None:
             return None
         try:
@@ -431,7 +497,7 @@ class ATSAdapter(ABC):
         except PlaywrightError as e:
             logger.debug("%s: clicking the upload trigger failed (%s).", self.name, e)
             return None
-        return find_file_upload_input(self.page)
+        return find_file_upload_input(self.form_root)
 
     #: Is a résumé visibly attached, as the FORM sees it? Checks the input's
     #: own `files` first, then — for ATS UIs that upload to S3 and clear the
@@ -458,7 +524,7 @@ class ATSAdapter(ABC):
         with no upload input isn't a page that lost the résumé, and treating
         the two the same would make every later step of a multi-step form
         re-attempt an upload it has no field for."""
-        upload_input = find_file_upload_input(self.page)
+        upload_input = find_file_upload_input(self.form_root)
         if upload_input is None:
             return "no_field"
         filename = Path(str(self.resume_document.stored_path)).name
@@ -510,6 +576,80 @@ class ATSAdapter(ABC):
             self.name, max_attempts,
         )
         return False
+
+    # ------------------------------------------------------------------
+    # Cover letter — only ever acted on if THIS page actually asks for one.
+    # Generation itself (job description + Master Profile -> LLM) lives in
+    # `automation/applications/cover_letter.py`; this class only detects
+    # whether/how a page wants one and fills whatever text/file it's handed
+    # — same separation of concerns as everything else in this file ("what
+    # field is this" here, "how do I put a value in it" in field_handlers.py).
+    # ------------------------------------------------------------------
+
+    def find_cover_letter_text_field(self) -> Locator | None:
+        """A free-text box asking for a cover letter, or `None` if this page
+        has none. Checked before any file input (see
+        `detect_cover_letter_field`): a form offering a dedicated text box
+        wants prose typed into it, not a file."""
+        candidates = self.form_root.locator("textarea, input[type='text']")
+        count = candidates.count()
+        for i in range(count):
+            candidate = candidates.nth(i)
+            try:
+                name_attr = (candidate.get_attribute("name") or "").lower()
+            except PlaywrightError:
+                name_attr = ""
+            question = self._question_text_for(candidate).lower()
+            if any(hint in question or hint in name_attr for hint in COVER_LETTER_TEXT_HINTS):
+                return candidate
+        return None
+
+    def find_cover_letter_upload_input(self) -> Locator | None:
+        """A file input specifically for a cover letter, distinct from the
+        résumé's — see `automation.browser.selectors.find_cover_letter_file_input`."""
+        return find_cover_letter_file_input(self.form_root)
+
+    def detect_cover_letter_field(self) -> tuple[str | None, Locator | None]:
+        """Whether THIS page asks for a cover letter at all, and how:
+        `("text", locator)` for a free-text box, `("file", locator)` for a
+        dedicated upload, or `(None, None)` — by far the common case — when
+        this page doesn't ask for one at all."""
+        text_field = self.find_cover_letter_text_field()
+        if text_field is not None:
+            return "text", text_field
+        file_input = self.find_cover_letter_upload_input()
+        if file_input is not None:
+            return "file", file_input
+        return None, None
+
+    def fill_cover_letter_field(self, locator: Locator, value: str) -> FieldFillResult:
+        """Fills a cover-letter field already found by `detect_cover_letter_field`.
+
+        `value` is typed prose for a `"text"` field or a local file path for
+        a `"file"` one — `fill_field()` dispatches on the field's actual DOM
+        shape either way, exactly like `upload_resume` above needs no
+        separate "is this a file" branch of its own. Marks the element
+        examined so the generic label/name sweep (`_fill_known_questions`)
+        never treats it as an ordinary, unmapped screening question and
+        sends it to the answer engine a second time."""
+        field = describe_field(locator, label="cover_letter", page=self.page)
+        outcome = fill_field(field, value, context=self._fill_context())
+        self._mark_examined(locator)
+        is_file = field.tag_name == "input" and field.input_type == "file"
+        value_used = Path(value).name if is_file else f"generated cover letter ({len(value)} chars)"
+        if outcome.filled:
+            logger.info("%s: cover letter %s.", self.name, "uploaded" if is_file else "entered")
+        else:
+            reason = outcome.failure.failure_reason if outcome.failure else "unknown"
+            logger.warning("%s: cover letter could not be filled (%s).", self.name, reason)
+        return FieldFillResult(
+            field_key="cover_letter",
+            profile_path="cover_letter",
+            value_used=value_used,
+            confidence=1.0 if outcome.filled else 0.0,
+            filled=outcome.filled,
+            failure=outcome.failure,
+        )
 
     # ------------------------------------------------------------------
     # Vision fallback — see automation/forms/vision_fallback.py
@@ -611,7 +751,7 @@ class ATSAdapter(ABC):
         again — see its docstring); the crop is taken BEFORE that probe so a
         menu that fails to close can't end up in the next field's screenshot."""
         collected: list[tuple[VisionField, Field]] = []
-        for name, locator in find_unfilled_required_field_locators(self.page):
+        for name, locator in find_unfilled_required_field_locators(self.form_root):
             question = self._question_text_for(locator)
             screenshot = self._vision_crop(locator)
             if screenshot is None:
@@ -688,7 +828,7 @@ class ATSAdapter(ABC):
                 )
                 outcome.results.append(FieldFillResult(
                     field_key=item.question or item.name, profile_path=profile_path,
-                    value_used=None, confidence=0.0, filled=False,
+                    value_used=None, confidence=0.0, filled=False, unfilled_reason="no_answer_available",
                 ))
                 continue
 
@@ -700,7 +840,7 @@ class ATSAdapter(ABC):
                 )
                 outcome.results.append(FieldFillResult(
                     field_key=item.question or item.name, profile_path=profile_path,
-                    value_used=None, confidence=0.0, filled=False,
+                    value_used=None, confidence=0.0, filled=False, unfilled_reason="low_confidence",
                 ))
                 continue
 
@@ -715,6 +855,7 @@ class ATSAdapter(ABC):
                 value_used=answer.answer,
                 confidence=answer.confidence if fill_outcome.filled else 0.0,
                 filled=fill_outcome.filled, failure=fill_outcome.failure,
+                unfilled_reason=None if fill_outcome.filled else "fill_failed",
             ))
 
         return outcome
@@ -732,7 +873,7 @@ class ATSAdapter(ABC):
         last_failure: FieldFailure | None = None
         for selector in selectors:
             try:
-                locator = self.page.locator(selector)
+                locator = self.form_root.locator(selector)
                 if locator.count() == 0:
                     continue
                 target = locator.first
@@ -831,7 +972,7 @@ class ATSAdapter(ABC):
         if for_id:
             escaped_id = for_id.replace("\\", "\\\\").replace('"', '\\"')
             try:
-                target = self.page.locator(f'[id="{escaped_id}"]')
+                target = self.form_root.locator(f'[id="{escaped_id}"]')
                 if target.count() > 0:
                     return target.first
             except PlaywrightError as e:
@@ -904,7 +1045,7 @@ class ATSAdapter(ABC):
         results: list[FieldFillResult] = []
         self._pending_answer_engine_questions = []
         self._seen_radio_groups = set()
-        labels = self.page.locator("label")
+        labels = self.form_root.locator("label")
 
         try:
             label_count = labels.count()
@@ -1230,7 +1371,10 @@ class ATSAdapter(ABC):
             profile_path = f"answer_engine:{answer_result.source}"
             field.profile_attribute = profile_path
             if not answer_result.answer:
-                results.append(FieldFillResult(field_key=text, profile_path=profile_path, value_used=None, confidence=0.0, filled=False))
+                results.append(FieldFillResult(
+                    field_key=text, profile_path=profile_path, value_used=None, confidence=0.0, filled=False,
+                    unfilled_reason="no_answer_available",
+                ))
                 continue
 
             # A generated answer the engine itself isn't confident in must not
@@ -1245,7 +1389,7 @@ class ATSAdapter(ABC):
                 )
                 results.append(FieldFillResult(
                     field_key=text, profile_path=profile_path, value_used=None,
-                    confidence=0.0, filled=False,
+                    confidence=0.0, filled=False, unfilled_reason="low_confidence",
                 ))
                 continue
 
@@ -1253,6 +1397,7 @@ class ATSAdapter(ABC):
             results.append(FieldFillResult(
                 field_key=text, profile_path=profile_path, value_used=answer_result.answer,
                 confidence=answer_result.confidence if outcome.filled else 0.0, filled=outcome.filled, failure=outcome.failure,
+                unfilled_reason=None if outcome.filled else "fill_failed",
             ))
 
         return results
@@ -1327,7 +1472,7 @@ class ATSAdapter(ABC):
         multi-step form) can't inherit stale ids.
         """
         try:
-            count = self.page.evaluate(
+            count = self.form_root.evaluate(
                 """([selector, stampAttr]) => {
                     document.querySelectorAll('[' + stampAttr + ']')
                         .forEach(el => el.removeAttribute(stampAttr));
@@ -1341,7 +1486,7 @@ class ATSAdapter(ABC):
             logger.debug("Could not stamp candidate fields (%s) — skipping this pass.", e)
             return []
         return [
-            self.page.locator(f'[{_AUTOMATION_CANDIDATE_ATTR}="{index}"]')
+            self.form_root.locator(f'[{_AUTOMATION_CANDIDATE_ATTR}="{index}"]')
             for index in range(int(count or 0))
         ]
 
@@ -1689,7 +1834,7 @@ class ATSAdapter(ABC):
             return []
 
         results: list[FieldFillResult] = []
-        labels = self.page.locator("label")
+        labels = self.form_root.locator("label")
         try:
             label_count = labels.count()
         except PlaywrightError:
@@ -1761,7 +1906,7 @@ class ATSAdapter(ABC):
         fails the second condition and is left exactly as the candidate
         would have left it — unchecked."""
         results: list[FieldFillResult] = []
-        labels = self.page.locator("label")
+        labels = self.form_root.locator("label")
 
         try:
             label_count = labels.count()

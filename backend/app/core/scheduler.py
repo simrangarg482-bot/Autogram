@@ -25,6 +25,7 @@ from app.core.config import (
     JOB_SYNC_COUNTRY,
     JOB_SYNC_INTERVAL_HOURS,
     JOB_SYNC_QUERIES,
+    REDIS_URL,
     RETENTION_PURGE_INTERVAL_HOURS,
 )
 from app.core.database import SessionLocal
@@ -76,6 +77,34 @@ def _run_retention_purge() -> None:
         db.close()
 
 
+#: How often to sweep for automation runs whose worker died (Phase 2d). Short
+#: enough that a dead worker's job is released within ~a minute; the lease TTL
+#: (`lease.DEFAULT_TTL_SECONDS`) is what actually decides "dead", this just
+#: polls for it.
+_ORPHAN_SWEEP_SECONDS = 60
+
+
+def _sweep_orphaned_automation() -> None:
+    """Periodic lease-based reconciliation. Only scheduled when REDIS_URL is
+    set: without leases, `is_held` is always False, so a periodic pass would
+    reconcile *live* in-process runs. At startup that's fine (fresh process);
+    on an interval it is not."""
+    from app.services.automation_recovery import reconcile_orphaned_automation_on_startup
+
+    db = SessionLocal()
+    try:
+        counts = reconcile_orphaned_automation_on_startup(db)
+        if any(counts.values()):
+            logger.warning(
+                "Orphan sweep: recovered %d autonomous task(s), %d application(s).",
+                counts["autonomous_tasks"], counts["applications"],
+            )
+    except Exception:
+        logger.exception("Orphan sweep cycle failed")
+    finally:
+        db.close()
+
+
 def start_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:
@@ -110,5 +139,19 @@ def start_scheduler() -> None:
         next_run_time=datetime.now() + timedelta(minutes=1),  # let the app finish booting first
     )
     logger.info("Retention purge scheduled: every %dh", RETENTION_PURGE_INTERVAL_HOURS)
+
+    if REDIS_URL:
+        _scheduler.add_job(
+            _sweep_orphaned_automation,
+            trigger="interval",
+            seconds=_ORPHAN_SWEEP_SECONDS,
+            id="orphan_sweep",
+            max_instances=1,
+            coalesce=True,
+            next_run_time=datetime.now() + timedelta(seconds=_ORPHAN_SWEEP_SECONDS),
+        )
+        logger.info("Orphaned-automation sweep scheduled: every %ds (Redis lease-based).", _ORPHAN_SWEEP_SECONDS)
+    else:
+        logger.info("Orphaned-automation sweep disabled (REDIS_URL not set — startup reconciliation only).")
 
     _scheduler.start()

@@ -35,24 +35,23 @@ and they need different fixes:
 
 ## Why startup reconciliation is sound here
 
-At process start these registries are EMPTY by construction (fresh module-level
-dicts), so any active status in the database was left by a previous process. The
-autonomous reconciler already argues exactly this for `_REGISTRY`; the same
-argument applies verbatim to `_OPEN_REVIEW_SESSIONS`.
+**Without `REDIS_URL`:** at process start these registries are EMPTY by
+construction (fresh module-level dicts), so any active status in the database
+was left by a previous process. This runs at startup only — single process, so
+there is never a live run in another process to misjudge.
 
-That argument depends on the deployment being single-process, which is a
-verified, documented precondition of this codebase, not an assumption:
-`requirements.txt` ships `uvicorn[standard]` and no other HTTP server, there is
-no Dockerfile/Procfile/k8s manifest/`--workers`/`WEB_CONCURRENCY` anywhere, and
-the in-memory `_REGISTRY` design already requires it (a paused task can only be
-resumed by the process holding its handle). See `AUTONOMOUS_AGENT.md`'s
-"Deployment model: single-process, and that is compatible".
+**With `REDIS_URL` (Phase 2d):** every run — in-process or in a Celery worker —
+holds a Redis **lease** it heartbeats (`automation/coordination/lease.py`,
+taken by `app/workers/runtime.py`). So "is this row orphaned?" stops being an
+inference from process lifetime and becomes a direct check: `lease.is_held()`.
+That check holds for a *periodic* pass too, so this same function is scheduled
+every ~60 s (`app/core/scheduler.py`) — a dead worker's run is released within
+about a minute instead of waiting for an API restart. The lease skip is a
+no-op when Redis is unset (`is_held` is always False), so the single-process
+behaviour above is unchanged.
 
-Recovery is nonetheless written to be race-safe (advisory lock + atomic
-conditional `UPDATE`), because that costs almost nothing and is what stops two
-recovery passes, or a recovery racing a fresh start, from disagreeing. What it
-does NOT do is make multi-process safe — see `REMAINING LIMITATIONS` at the
-bottom of this docstring.
+Recovery is race-safe either way (advisory lock + atomic conditional `UPDATE`):
+two recovery passes, or a recovery racing a fresh start, can't disagree.
 
 ## Why `processing` is recovered to `needs_review` and never to `failed`
 
@@ -87,18 +86,18 @@ work is real and a human should look at it, which is what `needs_review` means.
 
 ## REMAINING LIMITATIONS
 
-* Multi-process/replica deployments. If a second worker were ever introduced,
-  one worker starting up could reconcile a row another worker is actively
-  running, releasing ownership while a browser is still driving that
-  application. The advisory lock does not prevent this, because the running
-  worker holds no lock for the duration of its run. This is the same
-  single-process constraint `_REGISTRY` and `app/core/middleware.py`'s in-memory
-  rate limiter already carry, and the same Celery/Redis migration
-  `runner.py`'s docstring tracks would fix all three together.
+* A Redis outage long enough for a live run's lease to lapse (>45 s with no
+  successful heartbeat) makes that run briefly look orphaned. The window is
+  small, the heartbeat logs loudly on loss, and a recover-to-`needs_review` is
+  conservative (never `failed`, never auto-resubmit) — but it is possible.
 * A crash between the browser's Submit click and ANY local persistence is
   recovered to `needs_review`, which is honest but not precise: we cannot say
   whether the employer received it. Exactly-once submission is not claimed
   anywhere, and cannot be — see `submit_and_confirm`.
+* Copilot runs still keep their held-open browser in the process that ran them
+  (`_OPEN_REVIEW_SESSIONS`), so a recovered `copilot_review` row means that
+  browser is gone — the run is sent to `needs_review` for a human to restart.
+  Cross-worker copilot approve is roadmap 2f.
 """
 
 from __future__ import annotations
@@ -112,6 +111,7 @@ from sqlalchemy.orm import Session
 from app.models.db_models import Application
 from app.services import audit_log_repository as audit_log_repo
 from app.services import automation_ownership
+from automation.coordination import lease
 
 logger = logging.getLogger(__name__)
 
@@ -203,11 +203,22 @@ def try_recover_application(
 
 def reconcile_orphaned_applications_on_startup(db: Session) -> int:
     """Deterministic-path counterpart to
-    `runner.reconcile_orphaned_tasks_on_startup`. Called once from
-    `app/main.py` at process start, when `_OPEN_REVIEW_SESSIONS` is empty by
-    construction, so every row found here was abandoned by a previous process.
+    `runner.reconcile_orphaned_tasks_on_startup`.
 
-    Returns the number of applications recovered, for a one-line startup log.
+    Called at process start from `app/main.py` AND (Phase 2d — despite the
+    `_on_startup` name, kept to avoid churning ~40 call sites) periodically
+    from `app/core/scheduler.py` when `REDIS_URL` is set.
+
+    A row in a `DETERMINISTIC_RECOVERY` status is orphaned **unless a live run
+    lease says a worker is driving it right now** (`lease.is_held`). Before
+    Phase 2 the argument was "these registries are empty in a fresh process";
+    now it's the lease, which also holds for a *periodic* pass and across
+    replicas/workers. With `REDIS_URL` unset `lease.is_held` is always False,
+    so this reduces to the original startup-only behaviour — which is why the
+    scheduler only runs it periodically when Redis is present (see
+    `scheduler.py`).
+
+    Returns the number of applications recovered, for a one-line log.
     """
     # Snapshot the columns needed, rather than iterating live ORM objects.
     # `SessionLocal` leaves `expire_on_commit` at its default, so every commit
@@ -226,6 +237,11 @@ def reconcile_orphaned_applications_on_startup(db: Session) -> int:
     )
     recovered = 0
     for application_id, user_id, job_url, prior_status in orphaned:
+        # A worker currently holds this run's lease -> it's alive, not orphaned.
+        # No-op without Redis (is_held is always False), so single-process
+        # startup recovery is unchanged.
+        if lease.is_held("application", application_id):
+            continue
         # ERROR ISOLATION, same rule as the autonomous reconciler: one
         # unrecoverable row must not abort the pass and strand every later
         # orphan. `SQLAlchemyError` only — a programming bug must stay visible
@@ -281,13 +297,13 @@ def _recover_one(
 
 
 def reconcile_orphaned_automation_on_startup(db: Session) -> dict[str, int]:
-    """Single entry point for `app/main.py`, covering BOTH paths.
+    """Single entry point covering BOTH paths — used at process start
+    (`app/main.py`) and periodically (`app/core/scheduler.py`, Redis only;
+    `_on_startup` in the name is historical).
 
-    Wraps — rather than replaces — the existing
-    `runner.reconcile_orphaned_tasks_on_startup`, which already handled the
-    autonomous path correctly and stays the authority for it. Imported lazily
-    because `runner` pulls in the agent loop (and through it Playwright), which
-    has no business being imported by a service module at definition time.
+    Imported lazily because `runner` pulls in the agent loop (and through it
+    Playwright), which has no business being imported by a service module at
+    definition time.
 
     Each path is reconciled independently: a failure in one must not stop the
     other from running, since either left unreconciled means jobs stay blocked.

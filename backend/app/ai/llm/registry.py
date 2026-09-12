@@ -108,6 +108,18 @@ TASK_ROUTES: dict[str, TaskRoute] = {
         max_tokens=1500,
         json_mode=True,
     ),
+    # --- Cover letter generation (deterministic auto-apply flow) ---
+    # One call per application, and only when a page actually asks for one —
+    # see automation/applications/cover_letter.py. Plain prose, not JSON;
+    # temperature 0.5 for natural phrasing while still grounded in the real
+    # job description + Master Profile facts handed to it (never invented).
+    "cover_letter_generation": TaskRoute(
+        provider="openai",
+        model="gpt-4.1-mini",
+        temperature=0.5,
+        max_tokens=900,
+        json_mode=False,
+    ),
 }
 
 

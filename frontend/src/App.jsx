@@ -7,6 +7,8 @@ import {
 } from "lucide-react";
 import { api, auth, setUnauthorizedHandler } from "./api";
 import AuthPage from "./components/AuthPage";
+import ForgotPasswordPage from "./components/ForgotPasswordPage";
+import ResetPasswordPage from "./components/ResetPasswordPage";
 import BrandLogo from "./components/BrandLogo";
 import Landing from "./pages/Landing";
 import Home from "./pages/Home";
@@ -59,7 +61,13 @@ export default function App() {
     setMobileMenuOpen(false);
     window.scrollTo(0, 0);
     const page = NAV_LINKS.find((item) => item.end ? location.pathname === item.to : location.pathname.startsWith(item.to));
-    const publicTitle = { "/": "Your career, intelligently connected", "/login": "Sign in", "/signup": "Create your account" };
+    const publicTitle = {
+      "/": "Your career, intelligently connected",
+      "/login": "Sign in",
+      "/signup": "Create your account",
+      "/forgot-password": "Reset your password",
+      "/reset-password": "Set a new password",
+    };
     document.title = `${publicTitle[location.pathname] || page?.label || "Workspace"} · Autogram`;
   }, [location.pathname]);
 
@@ -116,9 +124,20 @@ export default function App() {
   }, [user]);
 
   async function handleAuthed(u) {
-    setUser(u);
+    setUser({ email: u.email });
     const destination = location.state?.from;
-    navigate(typeof destination === "string" && destination.startsWith("/") && !destination.startsWith("//") ? destination : "/dashboard", { replace: true });
+    const validDestination = typeof destination === "string" && destination.startsWith("/") && !destination.startsWith("//") ? destination : null;
+    // A brand-new signup with no deep link to return to lands on the master
+    // profile with an upload prompt (see Profile.jsx), instead of the
+    // dashboard every login goes to — that's the whole point of asking for a
+    // resume before there's anything else to show them.
+    if (validDestination) {
+      navigate(validDestination, { replace: true });
+    } else if (u.isNewSignup) {
+      navigate("/profile", { replace: true, state: { promptResumeUpload: true } });
+    } else {
+      navigate("/dashboard", { replace: true });
+    }
     try {
       const r = await api.listResumes();
       const latest = r?.resumes?.[0];
@@ -142,6 +161,10 @@ export default function App() {
   if (location.pathname === "/login" || location.pathname === "/signup") {
     return user ? <Navigate to="/dashboard" replace /> : <AuthPage key={location.pathname} initialMode={location.pathname === "/signup" ? "signup" : "login"} onAuthed={handleAuthed} />;
   }
+  // Public regardless of auth state: a logged-in user may still want to reset
+  // a forgotten/compromised password without logging out first.
+  if (location.pathname === "/forgot-password") return <ForgotPasswordPage />;
+  if (location.pathname === "/reset-password") return <ResetPasswordPage />;
   if (!user) return <Navigate to="/login" replace state={{ from: location.pathname + location.search + location.hash }} />;
 
   const healthColor =

@@ -1,12 +1,19 @@
 """
 Resume text extraction.
 
-Improvements over the naive version:
+Primary engine is MarkItDown (Microsoft's document-to-markdown converter),
+which handles both PDF and DOCX through one consistent code path. It's an
+optional dependency (see requirements.txt): if it isn't installed, or it
+returns too little text for a given file, extraction falls back to the
+hand-rolled extractors below, which predate it and are kept as a safety net
+rather than deleted:
 - Column-aware PDF extraction (two-column resumes no longer interleave)
 - OCR fallback for scanned/image-based PDFs (optional deps, graceful message if absent)
 - DOCX extraction includes tables, in true document order
-- Text cleaning (unicode normalization, de-hyphenation, bullet/whitespace normalization)
-  before anything is persisted or sent to the LLM
+
+Text cleaning (unicode normalization, de-hyphenation, bullet/whitespace
+normalization) is applied to whichever engine's output wins, before anything
+is persisted or sent to the LLM.
 """
 
 import re
@@ -194,6 +201,42 @@ def extract_text_from_docx(path: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# MarkItDown (primary engine)
+# ---------------------------------------------------------------------------
+
+def _extract_with_markitdown(path: str) -> str | None:
+    """Returns MarkItDown's markdown text, or None if MarkItDown isn't
+    installed or fails to produce anything — either case defers to the
+    legacy per-format extractors below, never raises past this point."""
+    try:
+        from markitdown import MarkItDown
+    except ImportError:
+        return None
+    try:
+        # enable_plugins=False: this only ever runs on a file we already
+        # downloaded from our own storage backend, so third-party MarkItDown
+        # plugins would add attack surface for no benefit here.
+        result = MarkItDown(enable_plugins=False).convert(path)
+        return result.text_content or None
+    except Exception:
+        return None
+
+
+def _extract_pdf(path: str) -> str:
+    text = _extract_with_markitdown(path)
+    if text and len(text.strip()) >= MIN_TEXT_LENGTH:
+        return text
+    return extract_text_from_pdf(path)  # legacy column-aware fallback
+
+
+def _extract_docx(path: str) -> str:
+    text = _extract_with_markitdown(path)
+    if text and len(text.strip()) >= MIN_TEXT_LENGTH:
+        return text
+    return extract_text_from_docx(path)  # legacy paragraph/table fallback
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -202,22 +245,33 @@ def extract_text(stored_path: str) -> str:
     Dispatches to the right extractor based on file extension, with OCR fallback
     for text-less PDFs. Cleans the text and validates it is non-trivial.
     Raises ExtractionError on any failure.
-    """
-    ext = Path(stored_path).suffix.lower()
 
-    try:
-        if ext == ".pdf":
-            text = extract_text_from_pdf(stored_path)
-            if len(text.strip()) < MIN_TEXT_LENGTH:
-                text = _ocr_pdf(stored_path)  # scanned/image PDF
-        elif ext == ".docx":
-            text = extract_text_from_docx(stored_path)
-        else:
-            raise ExtractionError(f"Unsupported extension for extraction: {ext}")
-    except ExtractionError:
-        raise
-    except Exception as e:
-        raise ExtractionError(f"Failed to extract text: {e}")
+    `stored_path` is whatever `StorageBackend.save()` returned — a real local
+    path under `STORAGE_BACKEND=local`, an `s3://` locator under `=s3`.
+    MarkItDown, pdfplumber, and python-docx all need an actual file on disk,
+    so this always goes through `local_path()` (a no-op under local storage;
+    a temp download, cleaned up on exit, under S3) rather than assuming
+    `stored_path` IS one — see `app/services/storage/base.py`'s module
+    docstring, Phase 3.
+    """
+    from app.services.storage import get_storage_backend
+
+    with get_storage_backend().local_path(stored_path) as local_path:
+        ext = Path(local_path).suffix.lower()
+
+        try:
+            if ext == ".pdf":
+                text = _extract_pdf(local_path)
+                if len(text.strip()) < MIN_TEXT_LENGTH:
+                    text = _ocr_pdf(local_path)  # scanned/image PDF
+            elif ext == ".docx":
+                text = _extract_docx(local_path)
+            else:
+                raise ExtractionError(f"Unsupported extension for extraction: {ext}")
+        except ExtractionError:
+            raise
+        except Exception as e:
+            raise ExtractionError(f"Failed to extract text: {e}")
 
     text = clean_text(text)
 

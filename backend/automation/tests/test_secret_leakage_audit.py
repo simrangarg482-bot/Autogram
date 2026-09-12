@@ -418,7 +418,7 @@ def test_respond_route_never_echoes_the_code_and_keeps_it_out_of_logs(monkeypatc
         lambda task_id, request_id, value: (delivered_values.append(value), True)[1],
     )
     monkeypatch.setattr(hi_api, "signal_resume", lambda task_id: True)
-    monkeypatch.setattr(hi_api, "start_task_background", lambda task_id: None)
+    monkeypatch.setattr(hi_api, "dispatch_autonomous_task", lambda task_id: None)
 
     with caplog.at_level(logging.DEBUG):
         result = hi_api.respond_to_human_request(

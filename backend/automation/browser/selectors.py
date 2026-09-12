@@ -15,9 +15,23 @@ import json
 import logging
 import re
 
-from playwright.sync_api import Error as PlaywrightError, Locator, Page
+from playwright.sync_api import Error as PlaywrightError, Frame, Locator, Page
 
 logger = logging.getLogger(__name__)
+
+# A same-origin-embedded ATS (iCIMS confirmed live: a real candidate-facing
+# form rendered entirely inside `#icims_content_iframe`) puts every one of
+# its fields somewhere `page.locator(...)` will never see them — the DOM
+# element genuinely doesn't exist in the top-level document. See
+# `resolve_form_root` below.
+#
+# Deliberately excludes `button`: an employer's marketing/careers site around
+# the actual form (nav bar, "Sign In", cookie-consent controls) is full of
+# buttons that have nothing to do with the application — counting them made
+# the very first live test of this ever look like "the top-level page has
+# plenty of fields" and never even check the iframe. `input`/`select`/
+# `textarea` are what an application form is actually made of.
+_FORM_CONTROL_SELECTOR = "input:not([type='hidden']):not([type='submit']):not([type='button']), select, textarea"
 
 # Heuristic text used across ATS platforms to find navigation controls.
 # Checked in this order — earlier entries are tried first.
@@ -32,6 +46,9 @@ FILE_INPUT_SELECTOR = "input[type='file']"
 # (a resume field alongside a separate cover-letter/"additional documents"
 # one) — generic hints, not any one company's field naming.
 RESUME_FILE_INPUT_HINTS = ["resume", "cv", "curriculum"]
+# The cover-letter counterpart of RESUME_FILE_INPUT_HINTS — see
+# find_cover_letter_file_input() below.
+COVER_LETTER_FILE_INPUT_HINTS = ["cover letter", "cover_letter", "coverletter", "letter"]
 CAPTCHA_HINTS = ["captcha", "recaptcha", "hcaptcha", "cf-turnstile", "turnstile"]
 
 # ATS forms mix real <button>s, <a> styled as buttons, and
@@ -479,6 +496,62 @@ def find_job_posting_title_and_company(page: Page) -> tuple[str | None, str | No
     return title or fallback_title, company or fallback_company
 
 
+def resolve_form_root(page: Page) -> Page | Frame:
+    """The right root to scan/fill FIELDS against — `page` itself for every
+    ATS that renders its form directly (Greenhouse, Lever, Workday, and
+    every other platform this codebase already supports), or a same-origin
+    content `<iframe>` for the platforms that don't.
+
+    Confirmed live on a real Atlassian/iCIMS posting: the entire "Enter
+    Your Information" form (email, a dropdown, a consent checkbox, the
+    Next button) exists ONLY inside `#icims_content_iframe`. Every selector
+    in this module operates on whatever it's handed, so scanning the wrong
+    root doesn't fail loudly, it just silently finds nothing — which is
+    exactly what happened before this existed: a real, visible, fillable
+    form scored 0% confidence because nothing on the page was ever "seen".
+
+    NOT gated on the top-level page having ZERO controls — a real page
+    almost always has at least one incidental one (a header search box, a
+    footer newsletter signup, a language picker) even when the actual
+    application form lives entirely in an iframe, and the very first live
+    test of this against a real page hit exactly that: 2 top-level controls
+    (neither part of any form) versus 5 inside the iframe. So this compares
+    COUNTS and only switches roots when an iframe has genuinely MORE form
+    controls than the top-level page — a normal page with an incidental
+    iframe (a chat widget, a video embed, a payment widget with 0-1 fields
+    of its own) never has enough to win that comparison and is unaffected.
+    Recomputed fresh on every call (a `Frame`/`Page`, not cached) rather
+    than resolved once, because a later page of the SAME multi-page
+    application can switch between rendering directly and rendering inside
+    an iframe."""
+    try:
+        top_level_count = page.locator(_FORM_CONTROL_SELECTOR).count()
+    except PlaywrightError:
+        return page
+
+    best_frame: Frame | None = None
+    best_count = top_level_count
+    for frame in page.frames:
+        if frame == page.main_frame:
+            continue
+        try:
+            count = frame.locator(_FORM_CONTROL_SELECTOR).count()
+        except PlaywrightError:
+            continue
+        if count > best_count:
+            best_count = count
+            best_frame = frame
+
+    if best_frame is not None:
+        logger.info(
+            "resolve_form_root: iframe %r has more form controls (%d) than the top-level page (%d) — using it.",
+            best_frame.name or best_frame.url, best_count, top_level_count,
+        )
+        return best_frame
+
+    return page
+
+
 def find_file_upload_input(page: Page, *, prefer_hints: list[str] = RESUME_FILE_INPUT_HINTS) -> Locator | None:
     """Returns the resume upload `<input type=file>`, or `None` if the
     current page has none (e.g. a later step of a multi-page form with no
@@ -511,6 +584,40 @@ def find_file_upload_input(page: Page, *, prefer_hints: list[str] = RESUME_FILE_
             return candidate
 
     return all_file_inputs.first
+
+
+def find_cover_letter_file_input(page: Page) -> Locator | None:
+    """A file input specifically for a cover letter, distinct from the
+    résumé's `find_file_upload_input()` above.
+
+    A page with only ONE file input never triggers this — that one input is
+    always the résumé's, never double-purposed — so this only returns
+    something when at least two file inputs exist and one's `name`/`id`/
+    `aria-label` mentions a cover-letter hint. Returns `None` (not a fallback
+    to "the other" input) when nothing matches: an unrelated second file
+    input (e.g. "additional documents") is not a cover-letter field just
+    because it exists."""
+    all_file_inputs = page.locator(FILE_INPUT_SELECTOR)
+    count = all_file_inputs.count()
+    if count < 2:
+        return None
+
+    for i in range(count):
+        candidate = all_file_inputs.nth(i)
+        try:
+            haystack = " ".join(
+                filter(None, [
+                    candidate.get_attribute("name"),
+                    candidate.get_attribute("id"),
+                    candidate.get_attribute("aria-label"),
+                ])
+            ).lower()
+        except PlaywrightError:
+            continue
+        if any(hint in haystack for hint in COVER_LETTER_FILE_INPUT_HINTS):
+            return candidate
+
+    return None
 
 
 def find_upload_trigger_button(page: Page) -> Locator | None:

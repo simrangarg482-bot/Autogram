@@ -150,7 +150,7 @@ def _install(monkeypatch, *, active=None, raise_integrity=False, lookups=None, s
     monkeypatch.setattr(agent_api, "task_repo", task_repo)
     monkeypatch.setattr(agent_api, "automation_ownership", ownership)
     monkeypatch.setattr(agent_api, "audit_log_repository", audit)
-    monkeypatch.setattr(agent_api, "start_task_background", lambda task_id: started.append(task_id))
+    monkeypatch.setattr(agent_api, "dispatch_autonomous_task", lambda task_id: started.append(task_id))
     # A duplicate must never get as far as reading a profile/résumé either.
     monkeypatch.setattr(
         agent_api, "_build_candidate_profile_snapshot",

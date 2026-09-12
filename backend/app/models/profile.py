@@ -381,6 +381,71 @@ class SkillsRequest(BaseModel):
     soft_skills: list[str] = Field(default_factory=list)
 
 
+# ---------- resume draft (POST /profile/documents/{id}/profile-draft) ----------
+
+class ResumeDraftEducation(BaseModel):
+    """One entry the resume parser found, shaped exactly like
+    `EducationRequest` so the frontend can pass it straight to
+    `POST /profile/education` once the user accepts it — never auto-saved."""
+
+    degree: str | None = None
+    university: str | None = None
+    field_of_study: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+
+
+class ResumeDraftExperience(BaseModel):
+    """Shaped like `ExperienceCreate` for the same reason as
+    `ResumeDraftEducation` above."""
+
+    company_name: str | None = None
+    job_title: str | None = None
+    start_date: str | None = None
+    end_date: str | None = None
+    description: str | None = None
+
+
+class ResumeDraftSkills(BaseModel):
+    """All six Master Profile skill buckets (same field set as
+    `SkillsRequest`) — the resume parser classifies every skill/technology
+    it finds into whichever of these it actually belongs to (a language into
+    `programming_languages`, a framework into `frameworks`, ...) rather than
+    dumping everything into `technical_skills`. See `resume_parser.py`'s
+    SYSTEM_PROMPT for the classification rules."""
+
+    programming_languages: list[str] = Field(default_factory=list)
+    frameworks: list[str] = Field(default_factory=list)
+    tools: list[str] = Field(default_factory=list)
+    certifications: list[str] = Field(default_factory=list)
+    technical_skills: list[str] = Field(default_factory=list)
+    soft_skills: list[str] = Field(default_factory=list)
+
+
+class ResumeDraftResponse(BaseModel):
+    """`POST /profile/documents/{id}/profile-draft` — everything
+    `profile_draft.py` could read from one resume, for the user to review
+    before anything is saved. Scalar fields merge into the main profile form
+    (`ProfileUpsertRequest`'s fields); `skills`/`education`/`experience` are
+    reviewed and accepted into their own sections separately, since those
+    already have their own save actions."""
+
+    full_name: str | None = None
+    email: str | None = None
+    phone: str | None = None
+    location: str | None = None
+    linkedin_url: str | None = None
+    github_url: str | None = None
+    portfolio_url: str | None = None
+    professional_summary: str | None = None
+    current_company: str | None = None
+    current_role: str | None = None
+    years_of_experience: float | None = None
+    skills: ResumeDraftSkills = Field(default_factory=ResumeDraftSkills)
+    education: list[ResumeDraftEducation] = Field(default_factory=list)
+    experience: list[ResumeDraftExperience] = Field(default_factory=list)
+
+
 # ---------- documents ----------
 
 class DocumentResponse(BaseModel):

@@ -5,12 +5,18 @@ OAuth2 password-flow authentication with JWT bearer tokens.
   constant-time verification. Never stored or logged in plaintext.
 - Tokens: HS256 JWTs carrying the user_id (sub) with expiry.
 - get_current_user: FastAPI dependency that turns a Bearer token into a User
-  row or raises 401 — every user-scoped endpoint depends on it.
+  row or raises 401 — every user-scoped endpoint depends on it. Also enforces
+  account status: a suspended/banned user is rejected here with 403.
+- require_role / get_current_moderator / get_current_admin: role gates layered
+  on top of get_current_user (Phase 0 RBAC — see db_models.VALID_USER_ROLES).
+  The token carries `role` only as a frontend hint; this module always trusts
+  the freshly-read User row, never the claim.
 """
 
 import hashlib
 import hmac
 import os
+import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -45,11 +51,26 @@ def verify_password(password: str, stored: str) -> bool:
     return hmac.compare_digest(recomputed.hex(), digest_hex)
 
 
+# ---------- password reset tokens ----------
+# The raw token only ever exists in memory and in the emailed link — the DB
+# stores just its SHA-256 hash (a fast hash is fine here, unlike passwords:
+# the token is 256 bits of CSPRNG entropy, not something a human chose, so it
+# isn't subject to dictionary/brute-force attack the way a password is).
+
+def generate_reset_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def hash_reset_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
 # ---------- tokens ----------
 
-def create_access_token(user_id: str) -> str:
+def create_access_token(user_id: str, role: str = "member") -> str:
     payload = {
         "sub": user_id,
+        "role": role,  # frontend hint only — get_current_user re-reads the DB row
         "jti": str(uuid.uuid4()),
         "exp": datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES),
     }
@@ -79,4 +100,36 @@ def get_current_user(
     )
     if not user:
         raise credentials_error
+
+    # Account status gate (Phase 0). A suspended/banned user holds a valid
+    # token but must not be able to act — 403 with a reason they can read,
+    # distinct from the 401 an expired/invalid token gets.
+    if user.status == "banned":
+        raise HTTPException(status_code=403, detail="This account has been banned.")
+    if user.status == "suspended":
+        raise HTTPException(status_code=403, detail="This account is suspended.")
     return user
+
+
+def require_role(*roles: str, hide: bool = False):
+    """Build a dependency that admits only the given roles.
+
+    `hide=True` returns 404 instead of 403 for the wrong role — used by the
+    admin console so its endpoints don't even confirm they exist to a
+    non-admin. Community moderator controls use the default 403 (the member
+    already knows the feature exists; they just can't use it).
+    """
+    allowed = set(roles)
+
+    def dependency(user: User = Depends(get_current_user)) -> User:
+        if user.role not in allowed:
+            if hide:
+                raise HTTPException(status_code=404, detail="Not found.")
+            raise HTTPException(status_code=403, detail="Insufficient permissions.")
+        return user
+
+    return dependency
+
+
+get_current_moderator = require_role("moderator", "admin")
+get_current_admin = require_role("admin", hide=True)

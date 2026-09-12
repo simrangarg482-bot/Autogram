@@ -1755,3 +1755,54 @@ def test_a_human_gate_on_a_later_page_still_stops_the_run(requires_chromium, tmp
     assert "human_gate_detected" in manager.steps_completed
     assert adapter_cls.calls["fill_personal_information"] == 1  # and filled nothing there
     assert adapter_cls.calls["submit_application"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Application State wiring (automation/applications/application_state.py) —
+# ApplicationState's own logic is tested directly in test_application_state.py;
+# these confirm the flow manager actually feeds it, no browser needed.
+# ---------------------------------------------------------------------------
+
+def test_checkpoint_records_a_decision_on_the_managers_own_state(tmp_path):
+    manager = _bare_manager(tmp_path)
+
+    manager.checkpoint("navigated", page_number=1)
+
+    assert manager.state.current_page_number == 1
+    assert manager.state.decisions[-1].event == "navigated"
+
+
+def test_checkpoint_merges_the_state_snapshot_into_live_run_state(tmp_path):
+    from automation.applications.application_flow_manager import LIVE_RUN_STATE, clear_live_state
+
+    manager = _bare_manager(tmp_path)
+    try:
+        manager.checkpoint("step_0_filled", page_number=1)
+        live = LIVE_RUN_STATE[manager.application_id]
+        # Existing keys the Live Automation view already reads are untouched —
+        # this is additive, not a replacement of what was there before.
+        assert live["last_step"] == "step_0_filled"
+        assert live["page_number"] == 1
+        assert live["application_state"]["current_page_number"] == 1
+    finally:
+        clear_live_state(manager.application_id)
+
+
+def test_missing_required_fields_become_pending_user_input_on_the_managers_state(tmp_path):
+    manager = _bare_manager(tmp_path)
+
+    manager.state.record_missing_required(["work_authorization"], page_number=2)
+
+    pending = manager.state.pending_user_input
+    assert len(pending) == 1
+    assert pending[0].field_key == "work_authorization"
+    assert pending[0].reason == "missing_required"
+    assert pending[0].page_number == 2
+
+
+def test_validation_errors_are_reflected_on_the_managers_state(tmp_path):
+    manager = _bare_manager(tmp_path)
+
+    manager.state.record_validation_errors(["Phone number is invalid"])
+
+    assert manager.state.validation_errors == ["Phone number is invalid"]

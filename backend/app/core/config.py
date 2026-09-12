@@ -34,6 +34,60 @@ if not ENCRYPTION_KEY:
 # --- Optional: production hardening ---
 API_KEY = os.getenv("API_KEY")  # unset = auth disabled (local dev)
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "60"))
+
+# --- Password reset (transactional email) ---
+# Two send paths, tried in this order: SMTP (if SMTP_USER/SMTP_PASSWORD are
+# set) then Resend (if RESEND_API_KEY is set). Neither set = reset emails are
+# logged, not sent (local dev). Set one of them in production or
+# forgot-password requests silently do nothing for the user.
+RESEND_API_KEY = os.getenv("RESEND_API_KEY")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "Autogram <no-reply@autogram.dev>")
+
+# SMTP (e.g. Gmail with an App Password — https://myaccount.google.com/apppasswords).
+# SMTP_PASSWORD is a secret: set it only in your local .env, never commit it.
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
+# Base URL of the deployed FRONTEND — the reset link is
+# f"{APP_BASE_URL}/reset-password?token=...". Must not end with a slash.
+APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:5173").rstrip("/")
+RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("RESET_TOKEN_EXPIRE_MINUTES", "30"))
+
+# --- Redis (Phase 1 — PLATFORM_ROADMAP.md) ---
+# Shared store for the rate limiter (cross-replica sliding window) and the
+# live event bus (cross-replica WebSocket fan-out via pub/sub).
+#
+# OPTIONAL, but load-bearing for scale: with REDIS_URL unset the app still
+# runs, using the in-process rate limiter and in-process event fan-out — which
+# is correct ONLY for a single process. `app/main.py` logs a prominent warning
+# in that mode. A multi-replica deployment (and the Phase 2 worker) REQUIRE it.
+REDIS_URL = os.getenv("REDIS_URL") or None
+# When the app sits behind a reverse proxy / load balancer that terminates the
+# client connection (Railway, nginx, Cloudflare), `request.client.host` is the
+# proxy, not the caller — so the rate limiter would see one IP for everyone.
+# Set TRUST_PROXY=true to read the first hop of `X-Forwarded-For` instead.
+# Only enable this when a trusted proxy is actually in front, or a caller can
+# spoof their rate-limit bucket by sending the header themselves.
+TRUST_PROXY = os.getenv("TRUST_PROXY", "false").strip().lower() == "true"
+
+# --- Apply-job worker / Celery queue (Phase 2 — PLATFORM_ROADMAP.md) ---
+# The worker process runs Playwright applies off the request path. Broker and
+# result backend default to REDIS_URL (one Redis for everything); override only
+# to split them onto a separate instance/db.
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL") or REDIS_URL
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND") or REDIS_URL
+# Concurrent Playwright applies per worker process. Each holds a Chromium +
+# page in memory, so this is a RAM knob, not a CPU one — keep it low.
+WORKER_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", "2"))
+# Cross-worker copilot approve (Phase 2f): how long a worker keeps a finished
+# copilot_review run's lease + browser open, polling for the approve signal
+# a `POST /applications/{id}/approve` on any replica deposits, before giving
+# up. Matches the control flag's own TTL (30 min) — a flag that outlives this
+# wait is moot anyway, and giving up releases the lease so the next orphan
+# sweep moves the row to needs_review exactly as an API restart would today.
+COPILOT_APPROVAL_MAX_WAIT_SECONDS = int(os.getenv("COPILOT_APPROVAL_MAX_WAIT_SECONDS", "1800"))
+COPILOT_APPROVAL_POLL_SECONDS = float(os.getenv("COPILOT_APPROVAL_POLL_SECONDS", "3"))
 CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX") or None
 

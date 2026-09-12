@@ -46,6 +46,7 @@ from app.models.profile import (
     MAX_EXPERIENCE_BATCH,
     ProfileResponse,
     ProfileUpsertRequest,
+    ResumeDraftResponse,
     RetentionPolicyRequest,
     RetentionPolicyResponse,
     RetentionPurgeNowResponse,
@@ -551,7 +552,7 @@ def list_documents(
     return repo.list_documents(db, profile.profile_id, document_type=document_type)
 
 
-@router.post("/documents/{document_id}/profile-draft", response_model=ProfileUpsertRequest, response_model_exclude_unset=True)
+@router.post("/documents/{document_id}/profile-draft", response_model=ResumeDraftResponse, response_model_exclude_unset=True)
 def preview_profile_from_resume(
     document_id: str,
     user: User = Depends(get_current_user),
@@ -563,10 +564,35 @@ def preview_profile_from_resume(
         raise HTTPException(status_code=400, detail="Choose a resume to build your profile.")
     from app.services.profile_draft import draft_from_document
     try:
-        return ProfileUpsertRequest(**draft_from_document(document))
+        return ResumeDraftResponse(**draft_from_document(document))
     except Exception:
         logger.exception("Resume profile draft failed")
         raise HTTPException(status_code=422, detail="We could not read details from this resume. Try another file or enter your profile manually.")
+
+
+@router.post("/documents/{document_id}/apply-resume-draft", response_model=ProfileResponse)
+def apply_profile_from_resume(
+    document_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Extracts and SAVES a résumé's contents onto the caller's own profile —
+    the auto-fill half of onboarding (see `preview_profile_from_resume` above
+    for the read-only preview instead). Never overwrites a fact already on
+    the profile; see `profile_draft.apply_resume_draft_to_profile` for the
+    merge rules."""
+    profile = _get_owned_profile(db, user)
+    document = _get_owned_document(db, document_id, profile)
+    if document.document_type != "resume":
+        raise HTTPException(status_code=400, detail="Choose a resume to build your profile.")
+    from app.services.profile_draft import apply_resume_draft_to_profile, draft_from_document
+    try:
+        draft = draft_from_document(document)
+    except Exception:
+        logger.exception("Resume profile auto-fill failed")
+        raise HTTPException(status_code=422, detail="We could not read details from this resume. Try another file or enter your profile manually.")
+    profile = apply_resume_draft_to_profile(db, profile, draft)
+    return ProfileResponse(**repo.profile_to_dict(profile))
 
 
 @router.patch("/documents/{document_id}/set-default", response_model=DocumentResponse)

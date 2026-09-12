@@ -25,6 +25,31 @@ def test_draft_does_not_save_profile():
     save.assert_not_called()
 
 
+def test_apply_endpoint_saves_the_draft_onto_the_profile():
+    candidate = SimpleNamespace(profile_id="mine")
+    document = SimpleNamespace(profile_id="mine", document_type="resume")
+    updated = SimpleNamespace(profile_id="mine")
+    with patch.object(profile.repo, "get_by_user_id", return_value=candidate), \
+         patch.object(profile.repo, "get_document", return_value=document), \
+         patch("app.services.profile_draft.draft_from_document", return_value={"full_name": "Ada"}), \
+         patch("app.services.profile_draft.apply_resume_draft_to_profile", return_value=updated) as apply, \
+         patch.object(profile.repo, "profile_to_dict", return_value={"profile_id": "mine", "user_id": "owner"}):
+        result = profile.apply_profile_from_resume("document", SimpleNamespace(user_id="owner"), object())
+    apply.assert_called_once()
+    assert apply.call_args.args[1] is candidate
+    assert apply.call_args.args[2] == {"full_name": "Ada"}
+    assert result.profile_id == "mine"
+
+
+def test_apply_endpoint_rejects_non_resume_documents():
+    candidate = SimpleNamespace(profile_id="mine")
+    document = SimpleNamespace(profile_id="mine", document_type="cover_letter")
+    with patch.object(profile.repo, "get_by_user_id", return_value=candidate), patch.object(profile.repo, "get_document", return_value=document):
+        with pytest.raises(HTTPException) as error:
+            profile.apply_profile_from_resume("document", SimpleNamespace(user_id="owner"), object())
+    assert error.value.status_code == 400
+
+
 def test_first_upload_creates_profile_after_file_validation():
     user = SimpleNamespace(user_id="new-user")
     upload = UploadFile(filename="resume.pdf", file=BytesIO(b"%PDF-test"))

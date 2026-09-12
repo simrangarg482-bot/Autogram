@@ -101,7 +101,7 @@ def _install(monkeypatch, task, *, resumed=True):
     monkeypatch.setattr(agent_api, "human_interaction_repo", human_repo)
     monkeypatch.setattr(agent_api, "audit_log_repository", audit)
     monkeypatch.setattr(agent_api, "signal_resume", lambda task_id: resumed)
-    monkeypatch.setattr(agent_api, "start_task_background", lambda task_id: None)
+    monkeypatch.setattr(agent_api, "dispatch_autonomous_task", lambda task_id: None)
     monkeypatch.setattr(agent_api, "request_cancel", lambda task_id: True)
     return task_repo, human_repo, audit
 

@@ -2,12 +2,10 @@
 S3-compatible StorageBackend — AWS S3, Cloudflare R2, or MinIO, selected via
 `STORAGE_BACKEND=s3` (see `app.core.config`).
 
-Read-path caveat (see `base.py` module docstring for the full explanation):
-`text_extraction.py` and `automation/ats/base.py::upload_resume()` still read
-`stored_path` as a raw local path today. Save/delete are fully correct under
-S3; those two specific reads are a tracked follow-up, not silently broken —
-flagging it here again because it's the detail most likely to bite someone
-who flips `STORAGE_BACKEND=s3` without reading PHASE2_ARCHITECTURE.md first.
+Every caller that needs a real file on disk (`text_extraction.py`,
+`automation/ats/base.py::upload_resume()`) goes through `local_path()` (see
+`base.py`'s module docstring) rather than assuming `stored_path` already is
+one — Phase 3.
 """
 
 from __future__ import annotations

@@ -246,7 +246,18 @@ copy backend\.env.example backend\.env
 # 5. Run — tables, pgvector extension, and indexes are created automatically at startup
 cd backend
 alembic upgrade head
-uvicorn app.main:app --reload
+# --reload-dir scopes the file-watcher to source code only. Without it, --reload
+# defaults to watching this whole directory — including logs/ and storage/,
+# which a running automation writes into (screenshots, traces, session state)
+# the instant it starts. That self-triggers a reload mid-run, which kills the
+# API process and the in-flight automation with it.
+uvicorn app.main:app --reload --reload-dir app --reload-dir automation
+
+# In a THIRD terminal (same venv): the autonomous-agent / apply-job queue only
+# runs if something is consuming it. With REDIS_URL set, POST /agent/tasks and
+# POST /applications/start enqueue to Celery instead of running in-process —
+# so without this worker running, tasks queue and silently never execute.
+celery -A app.workers.celery_app.celery_app worker --loglevel=INFO --concurrency=2
 ```
 
 In a second terminal, run the frontend. Keep `VITE_API_URL` blank locally so
@@ -263,31 +274,19 @@ npm run dev
 > revision for every schema change and keep deployed migrations immutable;
 > never delete the version history from a live project.
 
-> ### ⚠️ Production deployment: SINGLE WORKER ONLY
+> ### Scaling out: set `REDIS_URL` first
 >
-> **Autogram currently supports exactly one application worker.** Run it as a
-> single `uvicorn` process — no `--workers`, no gunicorn with multiple workers,
-> no horizontally-scaled replicas.
->
-> This is a real architectural constraint, not a default worth overriding. Four
-> separate mechanisms keep state in **process memory**:
->
-> | Mechanism | Process-local state | What breaks with a second worker |
-> |---|---|---|
-> | `automation/agents/autonomous/runner.py::_REGISTRY` | `TaskHandle` per task — the pause/resume events and the live browser | A resume or OTP routed to a worker that does not own the handle cannot reach the browser |
-> | `application_flow_manager::_OPEN_REVIEW_SESSIONS` | The still-open browser of a `copilot_review` run | `POST /applications/{id}/approve` finds no session and can never submit |
-> | `app/services/event_bus.py` | WebSocket subscribers | A client connected to worker A never sees events published by worker B |
-> | `app/core/middleware.py` | In-memory rate limiter | Limits apply per worker, so the effective limit multiplies |
->
-> Startup reconciliation depends on the same property: it treats any
-> still-active row as abandoned *because* those registries are provably empty in
-> a fresh process. With a second worker, one starting up could recover a row
-> another worker is actively running — releasing job ownership while a browser
-> is still driving that application.
->
-> **Multi-worker deployment requires Redis/externalized state and coordinated
-> task ownership** (the Celery migration tracked in `runner.py`'s docstring). It
-> is a deliberate future phase, not a configuration flag.
+> Autogram runs multi-replica **once `REDIS_URL` is set** (Phase 1–2 —
+> [`PLATFORM_ROADMAP.md`](./PLATFORM_ROADMAP.md), [`SCALING.md`](./SCALING.md)):
+> the rate limiter and event bus become shared, apply runs (autopilot AND
+> copilot alike — Phase 2f) move to the `celery` worker service, and run
+> ownership is a Redis lease that a periodic sweep reconciles. A copilot run's
+> held-open browser still lives in whichever worker ran it, but
+> `POST /applications/{id}/approve` on any replica reaches it via a
+> cross-process signal, so approve works from any API replica regardless of
+> which worker is holding the browser. **Without `REDIS_URL` the old
+> constraint still holds** — one `uvicorn` process, no `--workers`, no
+> replicas — and the app warns about it at startup.
 
 Run the test suite with `pytest`.
 
@@ -359,7 +358,9 @@ Typical first workflow: `POST /jobs/ingest` → `POST /jobs/embed-pending` → `
 **Production architecture — DONE**:
 - **Schema hardening**: scores/salaries/experience are real `Float` columns (correct sorting & filtering), skills/keywords are `JSONB` (queryable), `match_results` has proper foreign keys with `ON DELETE CASCADE`, and resume embeddings live in pgvector alongside job vectors.
 - **Auth**: set `API_KEY` in `.env` → every endpoint requires `X-API-Key` (timing-safe comparison); unset = open local dev.
-- **Rate limiting**: per-IP sliding window (default 60 req/min, `RATE_LIMIT_PER_MINUTE`).
+- **RBAC** (Phase 0 — see [`PLATFORM_ROADMAP.md`](./PLATFORM_ROADMAP.md)): every user has a `role` (`member`/`moderator`/`admin`) and `status` (`active`/`suspended`/`banned`). `get_current_user` blocks suspended/banned accounts; `require_role()` / `get_current_admin` gate privileged surfaces. The first admin is set with `python scripts/make_admin.py <email>` — there is no API for it.
+- **Rate limiting**: per-IP sliding window (default 60 req/min, `RATE_LIMIT_PER_MINUTE`). Shared across replicas when `REDIS_URL` is set (Phase 1), in-process otherwise; fails open if Redis is unreachable. Set `TRUST_PROXY=true` behind a trusted reverse proxy so the limiter keys on `X-Forwarded-For`.
+- **Redis** (Phase 1, optional): a managed cloud Redis via `REDIS_URL` — the same pattern as `DATABASE_URL`/Neon. Serverless (Upstash), Redis Cloud, or Railway's plugin all work; use the TLS `rediss://` endpoint. When set, the rate limiter and the live WebSocket event bus share state across API replicas (pub/sub fan-out). Unset = in-process only, and the app warns at startup that it must run as a single process. `docker compose` provides a local one.
 - **Observability**: request logging with latency, global error handler (no stack traces leak), `/health` checks DB reachability.
 - **Tests**: `pytest` suite covering skill-gap scoring, hard filters, experience extraction, text cleaning, dedup keys, and the LLM router (routing, retries, overrides).
 

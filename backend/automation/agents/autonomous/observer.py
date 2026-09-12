@@ -63,7 +63,7 @@ _EXTRACT_ELEMENTS_JS = r"""
   const SELECTOR = [
     'a[href]', 'button', 'input', 'select', 'textarea',
     '[role="button"]', '[role="link"]', '[role="checkbox"]',
-    '[role="radio"]', '[role="combobox"]', '[contenteditable="true"]',
+    '[role="radio"]', '[role="combobox"]', '[role="textbox"]', '[contenteditable="true"]',
     // 'option': the individual choices inside an OPENED custom dropdown
     // (react-select-style, or a WAI-ARIA listbox/grid like Amex's
     // cx-select-input). Without this, a custom dropdown's options never
@@ -77,7 +77,7 @@ _EXTRACT_ELEMENTS_JS = r"""
     if (aria) return aria.trim();
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) {
-      const parts = labelledBy.split(/\\s+/).map(id => {
+      const parts = labelledBy.split(/\s+/).map(id => {
         const node = document.getElementById(id);
         return node ? node.innerText || node.textContent || '' : '';
       });
@@ -107,6 +107,7 @@ _EXTRACT_ELEMENTS_JS = r"""
   }
 
   function isVisible(el) {
+    if (el.closest('[aria-hidden="true"], [inert]')) return false;
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) return false;
     const style = window.getComputedStyle(el);
@@ -134,7 +135,7 @@ _EXTRACT_ELEMENTS_JS = r"""
   nodes.forEach((el, idx) => {
     el.setAttribute('data-agent-ref', String(idx));
     const tag = el.tagName.toLowerCase();
-    let type = el.getAttribute('type') || el.getAttribute('role') || tag;
+    let type = el.isContentEditable ? 'textbox' : el.getAttribute('type') || el.getAttribute('role') || tag;
     let options = null;
     if (tag === 'select') {
       options = Array.from(el.options).map(o => o.textContent.trim());
@@ -164,10 +165,10 @@ _EXTRACT_ELEMENTS_JS = r"""
       // Password values are masked at the source — a raw password must never
       // reach a PageState (persisted to the DB, sent to the LLM prompt, or
       // returned via the status API). Non-secret fields keep their real value.
-      value: (type === 'password') ? null : ('value' in el ? String(el.value || '').slice(0, 300) : null),
+      value: (type === 'password') ? null : (el.isContentEditable ? textOf(el).slice(0, 300) : 'value' in el ? String(el.value || '').slice(0, 300) : null),
       required: !!el.required || el.getAttribute('aria-required') === 'true',
-      disabled: !!el.disabled,
-      checked: 'checked' in el ? !!el.checked : null,
+      disabled: !!el.disabled || !!el.readOnly || el.getAttribute('aria-disabled') === 'true',
+      checked: 'checked' in el ? !!el.checked : el.hasAttribute('aria-checked') ? el.getAttribute('aria-checked') === 'true' : null,
       // Tri-state: true/false when the element actually declares
       // aria-selected (an option inside an opened listbox/grid), null when
       // it doesn't apply (most elements). This is the WAI-ARIA-authoritative
@@ -175,7 +176,12 @@ _EXTRACT_ELEMENTS_JS = r"""
       // directly so it can see an already-selected option without guessing.
       aria_selected: el.hasAttribute('aria-selected') ? (el.getAttribute('aria-selected') === 'true') : null,
       options,
-      selected_options: tag === 'select' ? Array.from(el.selectedOptions || []).map(o => textOf(o)) : null,
+      selected_options: tag === 'select' ? Array.from(el.selectedOptions || []).filter(o => o.value).map(o => textOf(o))
+        : el.getAttribute('role') === 'combobox'
+          ? Array.from((el.closest('[class*="select__control"], [class*="-control"]') || el.parentElement)
+              .querySelectorAll('[class*="single-value"], [class*="singleValue"], [class*="multi-value__label"], [class*="multiValueLabel"]')).map(textOf).filter(Boolean)
+          : null,
+      group_name: el.getAttribute('name') || '',
       autocomplete: (el.getAttribute('autocomplete') || '').toLowerCase(),
       inputmode: (el.getAttribute('inputmode') || '').toLowerCase(),
       maxlength: el.getAttribute('maxlength') ? parseInt(el.getAttribute('maxlength'), 10) : null,
@@ -194,7 +200,12 @@ _EXTRACT_ELEMENTS_JS = r"""
     id: form.id || '', name: form.getAttribute('name') || '', action: form.action || '',
     method: (form.method || 'get').toLowerCase(),
   })).slice(0, 20);
-  return {elements: out.slice(0, __MAX_ELEMENTS__), headings, dialogs, validation_messages, forms};
+  // Never drop application fields just because navigation links precede them.
+  const isField = e => ['input', 'select', 'textarea'].includes(e.tag)
+      || ['combobox', 'checkbox', 'radio', 'textbox'].includes(e.role)
+      || e.type === 'textbox';
+  let extras = 0;
+  return {elements: out.filter(e => isField(e) || extras++ < __MAX_ELEMENTS__), headings, dialogs, validation_messages, forms};
 }
 """
 
@@ -237,6 +248,7 @@ class PageElement:
     semantic_action: str | None = None
     action_confidence: str | None = None
     irreversible: bool = False
+    group_name: str = ""
 
     def as_dict(self) -> dict:
         return {
@@ -253,6 +265,7 @@ class PageElement:
             "semantic_action": self.semantic_action,
             "action_confidence": self.action_confidence,
             "irreversible": self.irreversible,
+            "group_name": self.group_name,
         }
 
 
@@ -337,7 +350,7 @@ def compute_page_completion(page_state: PageState) -> PageCompletion:
         if element.type in ("checkbox", "radio"):
             if not element.checked:
                 missing_refs.append(element.ref)
-        elif element.tag == "select":
+        elif element.tag == "select" or element.role == "combobox":
             if not element.value and not element.selected_options:
                 missing_refs.append(element.ref)
         elif not (element.value or "").strip():
@@ -385,6 +398,16 @@ def classify_page_type(page_state: "PageState") -> str:
         for el in page_state.elements
     )
     has_apply_entry = any(el.semantic_action in ("APPLY", "START_APPLICATION") for el in page_state.elements)
+    # Embedded forms can retain both the job description and a sticky Apply
+    # link. Candidate fields are stronger evidence than that entry link.
+    candidate_fields = [
+        el for el in page_state.elements
+        if el.tag in ("input", "textarea", "select")
+        and re.search(r"\b(first name|last name|full name|resume|résumé|cover letter)\b",
+                      el.name, re.IGNORECASE)
+    ]
+    if candidate_fields and any(el.semantic_action == "SUBMIT" for el in page_state.elements):
+        return "application_page"
     # Listing pages frequently contain search/filter/email-alert fields, so
     # the mere presence of an input must not make them application forms. A
     # visible apply-entry control plus ordinary job metadata is the stronger
@@ -483,6 +506,7 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
             validation_message=el.get("validation_message") or "",
             invalid=bool(el.get("invalid")),
             aria_selected=el.get("aria_selected"),
+            group_name=el.get("group_name") or "",
         )
         for el in raw_elements
     ]

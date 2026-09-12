@@ -22,6 +22,12 @@ from automation.agents.autonomous.executor import (
 
 
 class FakeLocator:
+    #: Defaults to "INPUT" so a bare `set_input_files` call — the common case,
+    #: and the only one most of these tests exercise — takes the fast path in
+    #: `_resolve_file_input` exactly as a real `<input type="file">` would.
+    #: `FakeButtonLocator` below overrides this for the fallback-search tests.
+    tag_name = "INPUT"
+
     def __init__(self):
         self.filled_with = None
         self.clicked = False
@@ -51,13 +57,62 @@ class FakeLocator:
     def inner_text(self, timeout=None):
         return "some text"
 
+    def evaluate(self, script):
+        return self.tag_name
+
+    def locator(self, selector: str) -> "FakeLocatorSearchResult":
+        # A plain FakeLocator (an ordinary input ref) never needs the
+        # fallback search — the "ref is already an input" tests return from
+        # `_resolve_file_input` before this is ever called.
+        return FakeLocatorSearchResult(None)
+
+
+class FakeLocatorSearchResult:
+    """Stands in for the Playwright locator a nested/page-wide `.locator(...)`
+    call returns — `.count()` reports how many matched, `.first` is the match
+    to act on. `target=None` models zero matches."""
+
+    def __init__(self, target: FakeLocator | None):
+        self._target = target
+
+    def count(self) -> int:
+        return 0 if self._target is None else 1
+
+    @property
+    def first(self) -> FakeLocator:
+        assert self._target is not None, "first accessed on an empty locator"
+        return self._target
+
+
+class FakeButtonLocator(FakeLocator):
+    """A styled upload trigger — not an `<input>` — with exactly one real
+    file input reachable via the ancestor-container search
+    `_resolve_file_input` performs. Mirrors Greenhouse's actual markup: a
+    hidden `<input type="file">` next to a visible "Attach" button, where only
+    the button is visible enough for `observer.py` to have tagged it."""
+
+    tag_name = "BUTTON"
+
+    def __init__(self, scoped_file_input: FakeLocator | None):
+        super().__init__()
+        self._scoped_file_input = scoped_file_input
+
+    def locator(self, selector: str) -> FakeLocatorSearchResult:
+        assert "input[@type='file']" in selector
+        return FakeLocatorSearchResult(self._scoped_file_input)
+
 
 class FakePage:
     def __init__(self):
         self.locators: dict[str, FakeLocator] = {}
         self.url = "https://example.com/apply"
+        #: `input[type='file']` page-wide fallback — no match unless a test
+        #: wires one up.
+        self.page_wide_file_input: FakeLocator | None = None
 
-    def locator(self, selector: str) -> FakeLocator:
+    def locator(self, selector: str):
+        if selector == "input[type='file']":
+            return FakeLocatorSearchResult(self.page_wide_file_input)
         loc = self.locators.setdefault(selector, FakeLocator())
         return loc
 
@@ -231,6 +286,64 @@ def test_upload_allowlist_is_not_defeated_by_path_spelling(tmp_path):
     result = executor.execute(AgentAction(action_type="upload_file", element_ref=0, file_path=roundabout))
 
     assert result.success, result.detail
+
+
+def test_upload_falls_back_to_the_real_file_input_behind_a_styled_button(tmp_path):
+    """The exact Greenhouse shape that broke in production: `observer.py`
+    only tags VISIBLE elements, so a hidden `<input type="file">` behind a
+    styled "Attach" button never gets its own ref — the model's only
+    option is the button, and a bare `set_input_files` on it raises
+    (`Node is not an HTMLInputElement`). `_resolve_file_input` must find the
+    real input via the ancestor-container search instead of failing outright."""
+    allowed = tmp_path / "resume.pdf"
+    allowed.write_text("%PDF-fake")
+
+    real_input = FakeLocator()
+    page = FakePage()
+    page.locators['[data-agent-ref="0"]'] = FakeButtonLocator(scoped_file_input=real_input)
+
+    executor = ActionExecutor(page, auto_submit_approved=False, allowed_upload_paths=[str(allowed)])
+    result = executor.execute(AgentAction(action_type="upload_file", element_ref=0, file_path=str(allowed)))
+
+    assert result.success, result.detail
+    assert real_input.filled_with == str(allowed)
+
+
+def test_upload_falls_back_to_the_page_wide_file_input_when_no_container_match(tmp_path):
+    """No recognizable ancestor container (form/fieldset/upload/attach class)
+    around the button — falls back further to the page's only
+    `<input type="file">`, still without ever guessing among several."""
+    allowed = tmp_path / "resume.pdf"
+    allowed.write_text("%PDF-fake")
+
+    real_input = FakeLocator()
+    page = FakePage()
+    page.locators['[data-agent-ref="0"]'] = FakeButtonLocator(scoped_file_input=None)
+    page.page_wide_file_input = real_input
+
+    executor = ActionExecutor(page, auto_submit_approved=False, allowed_upload_paths=[str(allowed)])
+    result = executor.execute(AgentAction(action_type="upload_file", element_ref=0, file_path=str(allowed)))
+
+    assert result.success, result.detail
+    assert real_input.filled_with == str(allowed)
+
+
+def test_upload_fails_clearly_when_no_unique_file_input_can_be_found(tmp_path):
+    """No container match and either zero or several page-wide file inputs —
+    must fail with a clear reason rather than guessing or raising a raw
+    Playwright exception."""
+    allowed = tmp_path / "resume.pdf"
+    allowed.write_text("%PDF-fake")
+
+    page = FakePage()
+    page.locators['[data-agent-ref="0"]'] = FakeButtonLocator(scoped_file_input=None)
+    # page.page_wide_file_input left None -> zero matches page-wide too
+
+    executor = ActionExecutor(page, auto_submit_approved=False, allowed_upload_paths=[str(allowed)])
+    result = executor.execute(AgentAction(action_type="upload_file", element_ref=0, file_path=str(allowed)))
+
+    assert not result.success
+    assert "file input" in result.detail.lower()
 
 
 def test_deterministic_path_may_write_a_verification_code():

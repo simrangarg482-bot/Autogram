@@ -37,8 +37,12 @@ services:
       # The container must never try to start the developer's browser for them.
       AUTOMATION_CDP_AUTOLAUNCH: "false"
       CORS_ORIGINS: http://localhost:5173
+      # Phase 1: shared rate limiter + cross-process event bus.
+      REDIS_URL: redis://redis:6379/0
     ports:
       - "8000:8000"
+    depends_on:
+      - redis
     volumes:
       # Résumés, encrypted automation sessions, and run artefacts (screenshots,
       # traces) must outlive the container — they are evidence of what was
@@ -66,3 +70,34 @@ services:
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:
       - api
+
+  redis:
+    image: redis:7-alpine
+    # Ephemeral on purpose: the event bus is a live tap and the rate-limiter
+    # window is short-lived — nothing here needs to survive a restart. Postgres
+    # remains the only durable store.
+    ports:
+      - "6379:6379"
+
+  # Phase 2: the apply-job worker. SAME image as the API (build context and
+  # Dockerfile), different start command — it runs Playwright and needs the
+  # identical Chromium install. Nothing enqueues to it until Phase 2c; it's
+  # here now so `docker compose up` matches the target topology.
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      AUTOMATION_CDP_URL: http://host.docker.internal:9222
+      AUTOMATION_CDP_AUTOLAUNCH: "false"
+    volumes:
+      - ./backend/storage:/app/storage
+      - ./backend/logs:/app/logs
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app.celery_app worker --loglevel=INFO --concurrency=2

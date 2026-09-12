@@ -21,6 +21,7 @@ from automation.browser.selectors import (
     find_upload_trigger_button,
     find_validation_errors,
     page_has_captcha,
+    resolve_form_root,
 )
 
 
@@ -352,6 +353,76 @@ def test_falls_back_to_the_first_file_input_when_no_hint_matches(page):
     found = find_file_upload_input(page)
     assert found is not None
     assert found.get_attribute("name") == "attachment_one"
+
+
+# ---------- resolve_form_root ----------
+# Confirmed live on a real Atlassian/iCIMS posting (careers-apac-atlassian.
+# icims.com): the entire application form is rendered inside
+# `#icims_content_iframe`, invisible to every other selector in this module.
+# These pin the exact bug that surfaced during that live test (an ordinary
+# marketing nav bar's <button>s made the top-level page look "non-empty" and
+# the iframe was never even considered) and the fix (compare real FIELD
+# counts, not just "is the top level exactly zero").
+
+def test_resolve_form_root_returns_the_page_itself_with_no_iframe(page):
+    _render(page, '<input type="text" name="email">')
+    assert resolve_form_root(page) is page
+
+
+def test_resolve_form_root_prefers_an_iframe_with_more_form_controls(page):
+    _render(
+        page,
+        """
+        <p>An ordinary page with nothing of its own to fill.</p>
+        <iframe srcdoc="<input id='email'><select><option>A</option></select>"></iframe>
+        """,
+    )
+    root = resolve_form_root(page)
+    assert root is not page
+    assert root.locator("input").count() == 1
+
+
+def test_resolve_form_root_is_not_fooled_by_ordinary_page_chrome_buttons(page):
+    """The exact live bug: a marketing nav bar's buttons (Products, Sign In,
+    Get it free, ...) must never make the top-level page look like it has a
+    form of its own — `<button>` isn't part of `_FORM_CONTROL_SELECTOR`."""
+    _render(
+        page,
+        """
+        <nav><button>Products</button><button>Solutions</button><button>Sign In</button></nav>
+        <iframe srcdoc="<input id='email'><select><option>A</option></select><input id='accept' type='checkbox'>"></iframe>
+        """,
+    )
+    root = resolve_form_root(page)
+    assert root is not page
+    assert root.locator("input").count() == 2
+
+
+def test_resolve_form_root_stays_on_the_page_when_the_iframe_has_fewer_fields(page):
+    """An incidental iframe (a chat widget, a video embed) with 0-1 fields of
+    its own must never win over a top-level page that already has a real,
+    bigger form."""
+    _render(
+        page,
+        """
+        <input name="first_name"><input name="last_name"><input name="email">
+        <iframe srcdoc="<input placeholder='chat message'>"></iframe>
+        """,
+    )
+    assert resolve_form_root(page) is page
+
+
+def test_resolve_form_root_picks_the_richer_of_two_iframes(page):
+    _render(
+        page,
+        """
+        <iframe srcdoc="<input placeholder='chat message'>"></iframe>
+        <iframe srcdoc="<input id='email'><select><option>A</option></select><input id='accept' type='checkbox'>"></iframe>
+        """,
+    )
+    root = resolve_form_root(page)
+    assert root is not page
+    assert root.locator("input").count() == 2
 
 
 # ---------- find_upload_trigger_button ----------

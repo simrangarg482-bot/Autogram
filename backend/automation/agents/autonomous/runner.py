@@ -1,34 +1,28 @@
 """
-Background execution for `AutonomousAgentLoop`.
+Shared execution + signalling for `AutonomousAgentLoop`.
 
-**Deviation from the repo's stated convention, and why:** `AUTONOMOUS_AGENT.md`
-/ this module's docstring both note that `automation/workers/celery_app.py`
-is still an empty stub — Phase 4's Celery/Redis wiring was never actually
-built (no `REDIS_URL` in `app/core/config.py`, no Celery `Task` classes
-anywhere in the repo). Blocking `POST /agent/tasks` on a synchronous browser
-run is not acceptable either. Rather than invent a parallel half-finished
-Celery integration that can't be exercised without a broker to test against,
-this module runs the loop on a plain daemon `threading.Thread` inside the
-FastAPI process — the same "background work, in-process" shape
-`app/api/resumes.py::_run_extraction` already uses via `BackgroundTasks`,
-just with a manually-managed thread because this job is long-running and
-needs external pause/resume signalling, which `BackgroundTasks` doesn't
-support.
+`execute_task_sync(task_id)` runs the loop to completion on the current
+thread. It is called two ways (chosen by `app/workers/dispatch.py`):
 
-TODO (tracked, not silently skipped): once `automation/workers/celery_app.py`
-is actually wired to a broker, migrate `start_task_background` to
-`apply_async` and replace `_REGISTRY`'s in-process `threading.Event`
-pause/resume signalling with a Celery-visible mechanism (e.g. polling
-`AutonomousTask.current_status` from within the task, or a Redis pub/sub
-channel) — the `TaskHandle`/`AutonomousAgentLoop` split above was kept
-deliberately narrow so that swap only touches this file, not `loop.py`.
+- **no `CELERY_BROKER_URL`** — from a daemon `threading.Thread` in the API
+  process (`dispatch_autonomous_task`), wrapped by `app/workers/runtime.py`
+  for the lease + heartbeat;
+- **broker set** — inside a Celery worker (`app/workers/tasks.py`), same
+  wrapper.
 
-Known limitation this implies: an in-flight PAUSED task's actual open
-browser tab does not survive a process restart (the `TaskHandle` living only
-in `_REGISTRY`, in memory) — the DB row does, so the API still reports
-accurate status, but resuming after a restart currently starts a fresh tab
-at `job_url` rather than continuing the literal same page. Documented in
-`AUTONOMOUS_AGENT.md`.
+`_REGISTRY` still holds the live `TaskHandle` (the `threading.Event`s and the
+open browser) for a run *in this process*. What changed in Phase 2b/2c: when a
+resume / cancel / OTP arrives at a process that ISN'T running the task,
+`signal_resume` / `request_cancel` / `deliver_secret` check the run's lease
+and, if a worker holds it, hand the signal over via
+`automation/coordination/control.py` (a Redis flag hash + a one-shot OTP
+mailbox). The loop consumes those alongside its local handle
+(`loop.py::_wait_for_resume`, `_try_consume_pending_secret`).
+
+Known limitation, unchanged: an in-flight PAUSED task's actual open browser
+tab does not survive a process restart (`TaskHandle` is in memory only) — the
+DB row does, so status stays accurate, but a resume after a restart starts a
+fresh tab at `job_url`. See `AUTONOMOUS_AGENT.md`.
 """
 
 from __future__ import annotations
@@ -42,6 +36,10 @@ from app.services import audit_log_repository as audit_log_repo
 from app.services import autonomous_task_repository as task_repo
 from app.services import human_interaction_repository as human_interaction_repo
 from automation.agents.autonomous.loop import AutonomousAgentLoop, TaskHandle
+from automation.coordination import control, lease
+
+#: The lease kind for autonomous-agent runs (see automation/coordination/lease.py).
+_LEASE_KIND = "autonomous_task"
 
 logger = logging.getLogger(__name__)
 
@@ -63,17 +61,35 @@ def is_running(task_id: str) -> bool:
         return task_id in _REGISTRY
 
 
-def start_task_background(task_id: str) -> None:
-    """Starts (or resumes into) the loop for `task_id` on a daemon thread.
-    Safe to call again for a task that's already running/paused — it's a
-    no-op in that case (the resume endpoints call `signal_resume` instead)."""
+def list_live_task_ids() -> list[str]:
+    """Task ids with a live in-process handle right now — an open browser, if
+    one was ever launched, lives only with one of these. Used at process
+    shutdown (`app/main.py`) to log exactly what a restart is about to orphan,
+    instead of finding out indirectly from `reconcile_orphaned_tasks_on_startup`
+    after the fact."""
+    with _REGISTRY_LOCK:
+        return list(_REGISTRY.keys())
+
+
+def execute_task_sync(task_id: str) -> None:
+    """Run the loop for `task_id` to completion ON THE CURRENT THREAD.
+
+    This is the shared body: `start_task_background` wraps it in a daemon
+    thread (in-process path), and `app/workers/runtime.py::run_autonomous_task`
+    calls it directly inside a Celery worker (queued path, lease-guarded).
+    Safe to call for a task that already has a live handle — no-op then."""
     if is_running(task_id):
-        logger.debug("start_task_background: task %s already has a live handle.", task_id)
+        logger.debug("execute_task_sync: task %s already has a live handle.", task_id)
         return
     handle = _get_or_create_handle(task_id)
     loop = AutonomousAgentLoop(task_id, handle)
-    thread = threading.Thread(target=_run_and_cleanup, args=(task_id, loop), daemon=True, name=f"agent-task-{task_id}")
-    thread.start()
+    _run_and_cleanup(task_id, loop)
+
+
+# NOTE: the in-process daemon-thread dispatch moved to
+# `app/workers/dispatch.py::dispatch_autonomous_task`, so that path goes
+# through `app/workers/runtime.py` (lease + heartbeat) like the queued one.
+# `execute_task_sync` above is the shared body both call.
 
 
 def deliver_secret(task_id: str, request_id: str, value: str) -> bool:
@@ -89,39 +105,59 @@ def deliver_secret(task_id: str, request_id: str, value: str) -> bool:
     The value lives only in `TaskHandle.pending_secret` in this process's
     memory, for exactly as long as it takes the loop to notice and consume
     it (`AutonomousAgentLoop._try_consume_pending_secret`, which clears the
-    slot immediately after reading) — never persisted, logged, or returned."""
+    slot immediately after reading) — never persisted, logged, or returned.
+
+    Multi-worker (Phase 2b): if the loop is running in a DIFFERENT process
+    (no local handle, but the run's lease is held), the code is handed over
+    via `control.deposit_secret` — a one-shot Redis mailbox the owning worker
+    `LPOP`s exactly once. See that function's security note on the tradeoff.
+    """
     with _REGISTRY_LOCK:
         handle = _REGISTRY.get(task_id)
-    if handle is None:
-        return False
-    handle.pending_secret = {"request_id": request_id, "value": value}
-    handle.resume_event.set()
-    return True
+    if handle is not None:
+        handle.pending_secret = {"request_id": request_id, "value": value}
+        handle.resume_event.set()
+        return True
+    if lease.is_held(_LEASE_KIND, task_id):
+        return control.deposit_secret(task_id, request_id, value)
+    return False
 
 
 def signal_resume(task_id: str) -> bool:
-    """Wakes a paused task's loop. Returns False if the task has no live
-    in-process handle (e.g. this process restarted after the task paused) —
-    the caller (`app/api/autonomous_agent.py`) falls back to
-    `start_task_background`, which begins a fresh run picking up the task's
-    persisted state (confirmed answers, RESUMING status) but a NEW browser
-    tab — see the module docstring's known limitation."""
+    """Wakes a paused task's loop. Returns True if the signal was delivered —
+    either to a live in-process handle, or (Phase 2b) to the worker that holds
+    this run's lease, via the Redis control channel.
+
+    Returns False only when NOBODY owns the run (no handle, no lease) — e.g.
+    the process died after the task paused. The caller
+    (`app/api/autonomous_agent.py`) then falls back to `start_task_background`,
+    which begins a fresh run from persisted state but a NEW browser tab — see
+    the module docstring's known limitation."""
     with _REGISTRY_LOCK:
         handle = _REGISTRY.get(task_id)
-    if handle is None:
-        return False
-    handle.resume_event.set()
-    return True
+    if handle is not None:
+        handle.resume_event.set()
+        return True
+    if lease.is_held(_LEASE_KIND, task_id):
+        control.send_signal(_LEASE_KIND, task_id, "resume")
+        return True
+    return False
 
 
 def request_cancel(task_id: str) -> bool:
+    """Signals cancellation to the loop. Callers persist the CANCELLED status
+    themselves regardless of the return value; this just makes the running
+    loop stop promptly. Delivered locally, or (Phase 2b) to the lease holder."""
     with _REGISTRY_LOCK:
         handle = _REGISTRY.get(task_id)
-    if handle is None:
-        return False
-    handle.cancel_requested.set()
-    handle.resume_event.set()  # wake it up if it was blocked waiting on a human
-    return True
+    if handle is not None:
+        handle.cancel_requested.set()
+        handle.resume_event.set()  # wake it up if it was blocked waiting on a human
+        return True
+    if lease.is_held(_LEASE_KIND, task_id):
+        control.send_signal(_LEASE_KIND, task_id, "cancel")
+        return True
+    return False
 
 
 def _run_and_cleanup(task_id: str, loop: AutonomousAgentLoop) -> None:
@@ -171,6 +207,12 @@ def reconcile_orphaned_tasks_on_startup(db) -> int:
     ]
     reconciled = 0
     for task_id, user_id, prior_status, approved in orphaned:
+        # Phase 2d: a worker currently holding this run's lease is alive and
+        # driving it — not orphaned. No-op without Redis (is_held always
+        # False), so single-process startup recovery is unchanged. This is
+        # also what makes it safe to call periodically, not just at startup.
+        if lease.is_held(_LEASE_KIND, task_id):
+            continue
         # ERROR ISOLATION. One unreconcilable task must not abort the pass and
         # leave every later orphan blocking its job — that is the exact failure
         # this whole function exists to prevent, so it must not be able to
@@ -213,8 +255,24 @@ def _reconcile_one_task(db, task_id: str, user_id: str, prior_status: str, appro
     # the user is TOLD the outcome is uncertain, instead of being handed a
     # bare "interrupted, start a new task" that quietly invites a duplicate
     # application to a real employer.
+    # A task in CREATED/ANALYZING_JOB never got past `AutonomousAgentLoop.run()`
+    # calling `_ensure_browser` — that only flips the status to RUNNING once a
+    # browser context actually opened (see `loop.py`). So a task orphaned at
+    # one of these two statuses never had a browser to lose: it was created,
+    # dispatched (`dispatch_autonomous_task`), and then nobody ever executed
+    # it — e.g. queued to Celery with no worker consuming it. That is a
+    # different, more useful thing to tell the user than "a restart killed
+    # your browser," and it can never be a submission-ambiguity case (no
+    # executor call was ever reachable before a browser exists).
+    never_started = prior_status in ("CREATED", "ANALYZING_JOB")
     may_have_submitted = approved and prior_status in ("RUNNING", "RESUMING")
-    if may_have_submitted:
+    if never_started:
+        error = (
+            "Automation never started — this task was queued but no automation worker picked it "
+            "up. No browser session was ever opened and nothing was submitted. Please confirm the "
+            "automation worker/queue is running, then start a new task."
+        )
+    elif may_have_submitted:
         error = (
             "Automation was interrupted by a server restart after you had approved submission, "
             "so its outcome could not be recorded. This application MAY OR MAY NOT have been "
@@ -253,7 +311,7 @@ def _reconcile_one_task(db, task_id: str, user_id: str, prior_status: str, appro
         db, user_id=user_id, autonomous_task_id=task_id,
         event_type="automation_failed", actor="system",
         metadata={
-            "reason": "orphaned_at_startup",
+            "reason": "never_started_orphan" if never_started else "orphaned_at_startup",
             "prior_status": prior_status,
             # Recorded so "could this one have reached the employer?" is
             # answerable later from the audit trail alone, rather than
@@ -262,7 +320,7 @@ def _reconcile_one_task(db, task_id: str, user_id: str, prior_status: str, appro
         },
     )
     logger.warning(
-        "Task %s: reconciled orphaned %s task to FAILED at startup (may_have_submitted=%s).",
-        task_id, prior_status, may_have_submitted,
+        "Task %s: reconciled orphaned %s task to FAILED (never_started=%s, may_have_submitted=%s).",
+        task_id, prior_status, never_started, may_have_submitted,
     )
     return 1

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
-import { Loader2, Save, Plus, Trash2, GraduationCap, Briefcase, Sparkles, UserCircle2 } from "lucide-react";
+import { Loader2, Save, Plus, Trash2, GraduationCap, Briefcase, Sparkles, UserCircle2, CloudUpload } from "lucide-react";
 import { api } from "../api";
 
 const FIELD_GROUPS = [
@@ -51,6 +51,18 @@ function SectionTitle({ icon: Icon, children }) {
   );
 }
 
+// Small per-section save action — every section writes through the same
+// PATCH/POST /profile call regardless of which button triggered it (the
+// profile is saved as one object), so this is one shared button rather than
+// N independent save paths.
+function SectionSaveButton({ saving, onClick, label = "Save section" }) {
+  return (
+    <button className="btn-ghost mt-4 text-xs" disabled={saving} onClick={onClick}>
+      {saving ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />} {label}
+    </button>
+  );
+}
+
 export default function Profile({ toast }) {
   const location = useLocation();
   const navigate = useNavigate();
@@ -64,21 +76,46 @@ export default function Profile({ toast }) {
   const [newEdu, setNewEdu] = useState({ degree: "", university: "", field_of_study: "", start_date: "", end_date: "" });
   const [newExp, setNewExp] = useState({ company_name: "", job_title: "", start_date: "", end_date: "", description: "" });
   const [skillsText, setSkillsText] = useState({});
+  // Résumé-parsed education/experience the user hasn't reviewed yet — shown
+  // as one-click suggestions alongside the manual add form. Nothing here is
+  // saved until the user clicks "Add" on a specific entry.
+  const [suggestedEducation, setSuggestedEducation] = useState(location.state?.resumeDraft?.education || []);
+  const [suggestedExperience, setSuggestedExperience] = useState(location.state?.resumeDraft?.experience || []);
+  // Onboarding entry point (see App.jsx::handleAuthed): a brand-new signup
+  // lands here with nothing to review yet, so this prompt uploads AND
+  // auto-saves the résumé in one step — unlike the résumé-suggestion cards
+  // above, which only ever stage suggestions the user must accept.
+  const [promptUpload, setPromptUpload] = useState(Boolean(location.state?.promptResumeUpload));
+  const [uploadingResume, setUploadingResume] = useState(false);
+  const resumeInputRef = useRef(null);
+
+  function mergeSkillsText(savedSkills, draftSkills) {
+    return Object.fromEntries(SKILL_KEYS.map((k) => {
+      const saved = (savedSkills?.[k] || []).join(", ");
+      if (saved) return [k, saved];
+      const draftValues = draftSkills?.[k];
+      return [k, draftValues?.length ? draftValues.join(", ") : ""];
+    }));
+  }
 
   async function load() {
+    const draft = location.state?.resumeDraft || {};
     try {
       const p = await api.getProfile();
-      const draft = location.state?.resumeDraft || {};
-      setProfile({ ...p, ...Object.fromEntries(Object.entries(draft).filter(([key]) => !p[key])) });
-      setSkillsText(Object.fromEntries(SKILL_KEYS.map((k) => [k, (p.skills?.[k] || []).join(", ")])));
+      setProfile({ ...p, ...Object.fromEntries(Object.entries(draft).filter(([key]) => key !== "skills" && key !== "education" && key !== "experience" && !p[key])) });
+      setSkillsText(mergeSkillsText(p.skills, draft.skills));
       const [edu, exp] = await Promise.all([api.listEducation(), api.listExperience()]);
       setEducation(edu);
       setExperience(exp);
     } catch (error) {
       if (error.status === 404) {
         setExists(false);
-        setProfile({});
-        setSkillsText(Object.fromEntries(SKILL_KEYS.map((key) => [key, ""])));
+        // No profile yet — the draft (if any) IS the starting point, not just
+        // a gap-filler over an existing one (that merge only makes sense in
+        // the success path above, where `p` already has real saved facts).
+        const { skills: _skills, education: _education, experience: _experience, ...scalarDraft } = draft;
+        setProfile({ ...scalarDraft });
+        setSkillsText(mergeSkillsText(null, draft.skills));
       } else {
         toast(error.message, "error");
       }
@@ -87,7 +124,7 @@ export default function Profile({ toast }) {
     }
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   function setField(key, value) {
     setProfile((p) => ({ ...p, [key]: value }));
@@ -111,6 +148,31 @@ export default function Profile({ toast }) {
       toast(e.message, "error");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function onUploadResume(file) {
+    if (!file) return;
+    setUploadingResume(true);
+    try {
+      const document = await api.uploadDocument(file, { documentType: "resume" });
+      const updated = await api.applyResumeDraft(document.document_id);
+      const [edu, exp] = await Promise.all([api.listEducation(), api.listExperience()]);
+      setProfile(updated);
+      setExists(true);
+      setEducation(edu);
+      setExperience(exp);
+      setSkillsText(mergeSkillsText(updated.skills, null));
+      toast("Profile filled in from your resume — review and edit below.", "success");
+      setPromptUpload(false);
+      navigate("/profile", { replace: true, state: null });
+    } catch (e) {
+      // Keep the prompt up so the user can retry with a different file —
+      // extraction failing is expected for some resumes (rule: never invent
+      // data, so a low-signal file is a hard failure, not a partial guess).
+      toast(e.message, "error");
+    } finally {
+      setUploadingResume(false);
     }
   }
 
@@ -141,6 +203,17 @@ export default function Profile({ toast }) {
     }
   }
 
+  async function acceptSuggestedEducation(index) {
+    const suggestion = suggestedEducation[index];
+    try {
+      const entry = await api.addEducation(suggestion);
+      setEducation((e) => [entry, ...e]);
+      setSuggestedEducation((s) => s.filter((_, i) => i !== index));
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  }
+
   async function addExperience() {
     if (!newExp.company_name && !newExp.job_title) return toast("Add at least a company or job title.", "error");
     try {
@@ -152,12 +225,52 @@ export default function Profile({ toast }) {
     }
   }
 
+  async function acceptSuggestedExperience(index) {
+    const suggestion = suggestedExperience[index];
+    try {
+      const entry = await api.addExperience(suggestion);
+      setExperience((e) => [entry, ...e]);
+      setSuggestedExperience((s) => s.filter((_, i) => i !== index));
+    } catch (e) {
+      toast(e.message, "error");
+    }
+  }
+
   if (loading) return <div className="flex justify-center py-20"><Loader2 size={26} className="animate-spin text-brand-600" /></div>;
   if (!profile) return <button className="btn-primary" onClick={() => { setLoading(true); load(); }}>Retry loading profile</button>;
 
   return (
     <div className="animate-fade-up space-y-5">
-      {reviewingDraft && <div className="card border-brand-200 p-4 text-sm" role="status">Review the contact details extracted from your resume, then select Save Profile. Your existing details have been kept. Experience, education, and screening answers can be added below.</div>}
+      {promptUpload && (
+        <div className="card border-brand-200 p-5" role="status">
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <p className="font-semibold text-slate-900">Upload your resume to get started</p>
+              <p className="mt-0.5 text-xs text-slate-500">
+                We'll fill in your contact info, experience, education, and skills automatically —
+                review and edit anything below afterward. Nothing is guessed.
+              </p>
+            </div>
+            <div className="flex shrink-0 items-center gap-2">
+              <button className="btn-primary" disabled={uploadingResume} onClick={() => resumeInputRef.current?.click()}>
+                {uploadingResume ? <Loader2 size={16} className="animate-spin" /> : <CloudUpload size={16} />}
+                {uploadingResume ? "Reading your resume…" : "Upload resume"}
+              </button>
+              <button className="btn-ghost text-xs" disabled={uploadingResume} onClick={() => setPromptUpload(false)}>
+                Skip for now
+              </button>
+            </div>
+            <input
+              ref={resumeInputRef}
+              type="file"
+              accept=".pdf,.docx"
+              className="hidden"
+              onChange={(e) => { onUploadResume(e.target.files[0]); e.target.value = ""; }}
+            />
+          </div>
+        </div>
+      )}
+      {reviewingDraft && <div className="card border-brand-200 p-4 text-sm" role="status">Review the details extracted from your resume in each section below, then save that section (or use "Save all profile fields" at the bottom). Your existing details have been kept.</div>}
       <div>
         <p className="page-kicker">Your foundation</p>
         <h1 className="page-title">Your master profile</h1>
@@ -182,6 +295,14 @@ export default function Profile({ toast }) {
               </label>
             ))}
           </div>
+          {group.title === "Professional" && (
+            <label className="mt-3 block">
+              <span className="field-label">Professional summary</span>
+              <textarea className="input min-h-[88px]" value={profile.professional_summary ?? ""}
+                onChange={(e) => setField("professional_summary", e.target.value)} />
+            </label>
+          )}
+          <SectionSaveButton saving={saving} onClick={save} />
         </div>
       ))}
 
@@ -201,11 +322,8 @@ export default function Profile({ toast }) {
             </label>
           ))}
         </div>
+        <SectionSaveButton saving={saving} onClick={save} />
       </div>
-
-      <button className="btn-primary" disabled={saving} onClick={save}>
-        {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Save Profile
-      </button>
 
       {/* Education */}
       <div id="profile-education" className="card p-6">
@@ -220,6 +338,22 @@ export default function Profile({ toast }) {
             <button className="btn-primary !px-3" onClick={addEducation}><Plus size={16} /></button>
           </div>
         </div>
+        {suggestedEducation.length > 0 && (
+          <div className="mb-4 space-y-2 rounded-lg border border-brand-200 bg-brand-50/40 p-3">
+            <p className="text-xs font-medium text-brand-700">Found in your résumé — add the ones that are right:</p>
+            {suggestedEducation.map((s, i) => (
+              <div key={i} className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
+                <span className="text-slate-700">{s.degree}{s.field_of_study ? `, ${s.field_of_study}` : ""} — {s.university}{s.end_date ? ` (${s.end_date})` : ""}</span>
+                <div className="flex shrink-0 gap-1.5">
+                  <button className="btn-ghost !px-2.5 !py-1 text-xs" onClick={() => acceptSuggestedEducation(i)}><Plus size={13} /> Add</button>
+                  <button className="text-slate-400 hover:text-red-600" onClick={() => setSuggestedEducation((s) => s.filter((_, x) => x !== i))} title="Dismiss">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="space-y-2">
           {education.map((e) => (
             <div key={e.education_id} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
@@ -243,6 +377,22 @@ export default function Profile({ toast }) {
           <input className="input" placeholder="End (blank = current)" value={newExp.end_date} onChange={(e) => setNewExp({ ...newExp, end_date: e.target.value })} />
           <button className="btn-primary" onClick={addExperience}><Plus size={16} /> Add</button>
         </div>
+        {suggestedExperience.length > 0 && (
+          <div className="mb-4 space-y-2 rounded-lg border border-brand-200 bg-brand-50/40 p-3">
+            <p className="text-xs font-medium text-brand-700">Found in your résumé — add the ones that are right:</p>
+            {suggestedExperience.map((s, i) => (
+              <div key={i} className="flex items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
+                <span className="text-slate-700">{s.job_title} at {s.company_name} ({s.start_date}–{s.end_date || "present"})</span>
+                <div className="flex shrink-0 gap-1.5">
+                  <button className="btn-ghost !px-2.5 !py-1 text-xs" onClick={() => acceptSuggestedExperience(i)}><Plus size={13} /> Add</button>
+                  <button className="text-slate-400 hover:text-red-600" onClick={() => setSuggestedExperience((s) => s.filter((_, x) => x !== i))} title="Dismiss">
+                    <Trash2 size={13} />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="space-y-2">
           {experience.map((e) => (
             <div key={e.experience_id} className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-4 py-2.5 text-sm">
@@ -269,6 +419,16 @@ export default function Profile({ toast }) {
         </div>
         <button className="btn-primary mt-4" disabled={saving} onClick={saveSkills}>
           {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Save Skills
+        </button>
+      </div>
+
+      <div className="card flex items-center justify-between gap-4 p-6">
+        <div>
+          <p className="font-semibold text-slate-900">Save everything above</p>
+          <p className="text-xs text-slate-500">Identity, location, professional, work authorization, and screening fields all save together.</p>
+        </div>
+        <button className="btn-primary" disabled={saving} onClick={save}>
+          {saving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />} Save all profile fields
         </button>
       </div>
     </div>

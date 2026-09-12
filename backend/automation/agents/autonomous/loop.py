@@ -37,6 +37,7 @@ from app.services.autonomous_task_repository import TerminalTaskError
 from automation.agents.autonomous.actions import ActionResult, AgentAction, validate_action_grounding
 from automation.agents.autonomous.decision import Decision, DecisionError, decide_next_step, normalize_intervention_type
 from automation.agents.autonomous.executor import ActionExecutor, is_verification_code_field_name
+from automation.agents.autonomous.field_coverage import unresolved_fields
 from automation.agents.autonomous.observer import (
     CONFIRMATION_PHRASES,
     PageState,
@@ -45,6 +46,7 @@ from automation.agents.autonomous.observer import (
     observe_page,
 )
 from automation.applications.page_navigator import PageSignature, capture_page_signature
+from automation.coordination import control
 from automation.ats.detector import ATSDetector
 from automation.browser.browser_manager import BrowserAutomationError, BrowserManager
 from automation.interfaces import automation_db_session
@@ -160,6 +162,7 @@ class AutonomousAgentLoop:
                 logger.error("AutonomousAgentLoop: task %s not found.", self.task_id)
                 return
 
+            logger.info("Task %s: loop starting (status=%s, job_url=%s).", self.task_id, task.current_status, task.job_url)
             self._record_audit(db, task, "automation_started", {"status_at_start": task.current_status})
             self._record_chat_milestone(
                 db, task, "Autogram started analyzing the job page.",
@@ -225,21 +228,30 @@ class AutonomousAgentLoop:
 
     def _ensure_browser(self, task) -> None:
         if self.handle.page is not None:
+            logger.info("Task %s: reusing already-open browser session (resume).", self.task_id)
             return  # already open (a resume) — reuse the SAME tab/session
+        logger.info("Task %s: launching browser context.", self.task_id)
         manager = BrowserManager(user_id=task.user_id, ats_platform="autonomous_agent")
         manager.launch_context()
         page = manager.new_page()
+        logger.info(
+            "Task %s: browser context ready (mode=%s) — navigating to %s.",
+            self.task_id, manager.active_mode, task.job_url,
+        )
         navigation = ActionExecutor(page, auto_submit_approved=False).execute(
             AgentAction(action_type="navigate", url=task.job_url)
         )
         if not navigation.success or not navigation.verified:
+            logger.warning("Task %s: initial navigation failed — %s", self.task_id, navigation.detail)
             manager.close()
             raise BrowserAutomationError(navigation.detail)
+        logger.info("Task %s: navigation complete — page loaded at %s.", self.task_id, page.url)
         self.handle.browser_manager = manager
         self.handle.page = page
 
     def _close_browser(self) -> None:
         if self.handle.browser_manager is not None:
+            logger.info("Task %s: closing browser context.", self.task_id)
             self.handle.browser_manager.close()
         self.handle.browser_manager = None
         self.handle.page = None
@@ -266,6 +278,11 @@ class AutonomousAgentLoop:
     def _loop_body(self, db, task) -> None:
         iterations = 0
         while True:
+            # A cancel can arrive on the local handle (same process) or, when
+            # this loop runs in a worker, via the Redis control channel from
+            # whichever API replica served POST /agent/tasks/{id}/stop.
+            if control.consume_signal("autonomous_task", self.task_id, "cancel"):
+                self.handle.cancel_requested.set()
             if self.handle.cancel_requested.is_set():
                 task_repo.cancel_task(db, task)
                 self._record_audit(db, task, "automation_cancelled", {})
@@ -409,6 +426,9 @@ class AutonomousAgentLoop:
                 continue
 
             if decision.decision_type == "APPLICATION_READY_FOR_SUBMISSION":
+                if not self._ensure_field_coverage(db, task, page_state):
+                    self._wait_for_resume()
+                    continue
                 task_repo.mark_ready_for_approval(db, task, {
                     "decision": decision.decision_type, "evidence": decision.evidence,
                 })
@@ -422,6 +442,9 @@ class AutonomousAgentLoop:
 
             if decision.decision_type == "TASK_COMPLETED":
                 if not self._page_shows_confirmation(page_state):
+                    if not self._ensure_field_coverage(db, task, page_state):
+                        self._wait_for_resume()
+                        continue
                     logger.warning(
                         "Task %s: LLM reported TASK_COMPLETED but no confirmation text was found — "
                         "treating as ready-for-submission instead of trusting the claim.",
@@ -458,6 +481,24 @@ class AutonomousAgentLoop:
         haystack = f"{page_state.title} {page_state.visible_text}".lower()
         return any(phrase in haystack for phrase in CONFIRMATION_PHRASES)
 
+    def _ensure_field_coverage(self, db, task, page_state: PageState) -> bool:
+        missing = unresolved_fields(page_state, task.confirmed_answers)
+        if not missing:
+            return True
+        question = missing[0]
+        label = question.name or question.section or f"Unlabelled field {question.ref}"
+        logger.info("Task %s: advancement blocked; unresolved_fields=%d next_field_ref=%d required=%s",
+                    self.task_id, len(missing), question.ref, question.required)
+        self._pause_for_human(db, task, {
+            "type": "missing_information",
+            "reason": "Application fields remain unresolved before advancing or final review.",
+            "message": f"Before I continue, please provide or confirm an answer for: {label}. "
+                       + ("" if question.required else 'You can say "leave blank" for this optional field. ')
+                       + f"{len(missing)} field(s) still need to be resolved. I will use your answer and check the form again.",
+            "information_required": label,
+        })
+        return False
+
     def _handle_execute_action(
         self, db, task, page_state: PageState, decision: Decision, *, recover_grounding: bool = True,
     ) -> bool:
@@ -469,6 +510,12 @@ class AutonomousAgentLoop:
         if action.element_ref is not None:
             match = next((e for e in page_state.elements if e.ref == action.element_ref), None)
             element_name = match.name if match else None
+
+        if (action.action_type == "click" and match is not None
+                and match.semantic_action in ("NEXT", "CONTINUE", "SAVE_AND_CONTINUE", "REVIEW", "SUBMIT")
+                and page_state.page_type in ("application_page", "review")
+                and not self._ensure_field_coverage(db, task, page_state)):
+            return False
 
         grounding = validate_action_grounding(
             action,
@@ -978,7 +1025,10 @@ class AutonomousAgentLoop:
         immediately raised a NEW pause (e.g. the field vanished) — the caller
         must `_wait_for_resume()` before continuing, exactly like every other
         pause branch in `_loop_body`."""
-        secret = self.handle.pending_secret
+        # Local delivery (`runner.deliver_secret`, same process) or, when this
+        # loop runs in a worker, the one-shot Redis mailbox
+        # (`control.deposit_secret` from the API replica that received the OTP).
+        secret = self.handle.pending_secret or control.collect_secret(self.task_id)
         if secret is None:
             return None
         self.handle.pending_secret = None  # clear immediately after reading, before any use
@@ -1096,11 +1146,17 @@ class AutonomousAgentLoop:
         run: the leaked drivers accumulated until later tests could no longer
         get a browser.)"""
         while True:
+            # Local handle first, then the Redis control channel (worker path):
+            # a resume/cancel raised on any API replica lands here.
+            if control.consume_signal("autonomous_task", self.task_id, "cancel"):
+                self.handle.cancel_requested.set()
             if self.handle.cancel_requested.is_set():
                 return False
+            if control.consume_signal("autonomous_task", self.task_id, "resume"):
+                self.handle.resume_event.set()
             # Poll on a bounded wait rather than an unbounded one so a
-            # cancel that arrives while we're already waiting is noticed
-            # promptly instead of only at the next resume signal.
+            # cancel/resume that arrives while we're already waiting is noticed
+            # promptly instead of only at the next signal.
             if self.handle.resume_event.wait(timeout=2.0):
                 return True
 

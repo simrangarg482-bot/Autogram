@@ -51,10 +51,10 @@ from app.services.document_storage import (
     stage_stored_file_for_agent,
 )
 from app.services.event_bus import publish_task_event
+from app.workers.dispatch import dispatch_autonomous_task
 from automation.agents.autonomous.runner import (
     request_cancel,
     signal_resume,
-    start_task_background,
 )
 
 
@@ -500,7 +500,7 @@ def start_task(body: StartTaskRequest, user: User = Depends(get_current_user), d
 
     task_repo.set_status(db, task, "ANALYZING_JOB")
     # Only NOW is a browser allowed to exist for this job.
-    start_task_background(task.task_id)
+    dispatch_autonomous_task(task.task_id)
     return task
 
 
@@ -614,7 +614,7 @@ async def attach_task_document(
         action="DOCUMENT_ATTACHED",
     )
     if not signal_resume(task_id):
-        start_task_background(task_id)
+        dispatch_autonomous_task(task_id)
     return task_repo.get_by_id(db, task_id)
 
 
@@ -676,7 +676,7 @@ def resume_task(task_id: str, user: User = Depends(get_current_user), db: Sessio
         logger.exception("Task %s: could not write the resume to the chat transcript.", task_id)
     publish_task_event(task_id, "HUMAN_ACTION_COMPLETED", request_type=blocker, action="USER_CONFIRMED")
     if not signal_resume(task_id):
-        start_task_background(task_id)  # process restarted since pause — see runner.py docstring
+        dispatch_autonomous_task(task_id)  # process restarted since pause — see runner.py docstring
     return task_repo.get_by_id(db, task_id)
 
 
@@ -694,7 +694,7 @@ def answer_question(task_id: str, body: AnswerRequest, user: User = Depends(get_
     task_repo.record_confirmed_answer(db, task, body.question, body.answer)
     _resolve_active_request(db, task_id)
     if not signal_resume(task_id):
-        start_task_background(task_id)
+        dispatch_autonomous_task(task_id)
     return task_repo.get_by_id(db, task_id)
 
 
@@ -711,7 +711,7 @@ def approve_submission(task_id: str, user: User = Depends(get_current_user), db:
     task_repo.approve_submission(db, task)
     publish_task_event(task_id, "HUMAN_ACTION_COMPLETED", action="approved")
     if not signal_resume(task_id):
-        start_task_background(task_id)
+        dispatch_autonomous_task(task_id)
     return task_repo.get_by_id(db, task_id)
 
 

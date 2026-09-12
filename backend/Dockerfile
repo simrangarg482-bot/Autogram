@@ -31,8 +31,10 @@ COPY --chown=autogram:autogram . .
 USER autogram
 EXPOSE 10000
 
-# One process is required while task handles, browsers and event subscribers
-# remain in process memory. See README.md's single-worker limitation.
+# Multi-replica requires REDIS_URL (see SCALING.md); without it, run one
+# replica. The apply WORKER uses this same image with a different start
+# command: celery -A app.workers.celery_app.celery_app worker
+#
 # Migrations run before the web process in the same container (no separate
 # pre-deploy step): a migration failure then prevents a broken revision from
 # ever passing the health check.

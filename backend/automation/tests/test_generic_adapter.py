@@ -8,10 +8,13 @@ no ATS-specific knowledge of its own. See test_greenhouse_adapter.py for the
 same fixture/profile conventions this file follows.
 """
 
+from unittest.mock import patch
+
 import pytest
 
 from app.core.crypto import encrypt_field
 from app.models.db_models import CandidateProfile, ProfileDocument
+from automation.ats import base
 from automation.ats.generic.generic_adapter import GenericAdapter
 
 # A totally arbitrary custom careers page — no "job_application[...]" naming
@@ -147,6 +150,35 @@ def test_upload_resume_returns_false_when_no_file_input(page, resume_file):
     assert adapter.upload_resume() is False
 
 
+def test_upload_resume_materializes_an_s3_stored_document_first(page, monkeypatch):
+    """Phase 3: `stored_path` may be an `s3://` locator, not a real path —
+    `set_input_files` needs an actual file on disk, so `upload_resume` must go
+    through `StorageBackend.local_path()` rather than handing the locator to
+    Playwright directly."""
+    from moto import mock_aws
+
+    with mock_aws():
+        import boto3
+
+        from app.services.storage.s3_backend import S3StorageBackend
+
+        bucket = "autogram-test-bucket"
+        boto3.client("s3", region_name="us-east-1").create_bucket(Bucket=bucket)
+        backend = S3StorageBackend(bucket=bucket, region="us-east-1")
+        locator = backend.save("resumes/test.pdf", b"%PDF-1.4 fake resume bytes")
+        monkeypatch.setattr("automation.ats.base.get_storage_backend", lambda: backend)
+
+        page.set_content(CUSTOM_FORM_HTML)
+        adapter = GenericAdapter(
+            page=page, profile=_profile(),
+            resume_document=_resume_document(locator),
+        )
+
+        assert adapter.upload_resume() is True
+    uploaded_count = page.evaluate("document.querySelector('input[type=file]').files.length")
+    assert uploaded_count == 1
+
+
 def test_submit_application_clicks_a_send_application_button(page, resume_file):
     """`find_submit_button`'s text candidates include "Send Application" —
     not just Greenhouse's "Submit Application" — proving this isn't secretly
@@ -170,3 +202,44 @@ def test_is_final_page_true_with_no_next_control(page, resume_file):
     page.set_content(CUSTOM_FORM_HTML)
     adapter = GenericAdapter(page=page, profile=_profile(), resume_document=_resume_document(resume_file))
     assert adapter.is_final_page() is True
+
+
+# ---------------------------------------------------------------------------
+# form_root caching (automation/ats/base.py) — `resolve_form_root` scans
+# every frame on the page, and `form_root` is read many times while
+# processing one page (label sweep, name/placeholder sweep, résumé/cover-
+# letter upload, navigation lookup). These pin that it's computed once per
+# page rather than on every access, and that `reset_form_root_cache()` is
+# what makes the NEXT page re-resolve instead of reusing a stale value.
+# ---------------------------------------------------------------------------
+
+def test_form_root_is_resolved_once_and_reused_across_multiple_accesses(page, resume_file):
+    page.set_content(CUSTOM_FORM_HTML)
+    adapter = GenericAdapter(page=page, profile=_profile(), resume_document=_resume_document(resume_file))
+
+    with patch("automation.ats.base.resolve_form_root", wraps=base.resolve_form_root) as spy:
+        first = adapter.form_root
+        second = adapter.form_root
+        third = adapter.form_root
+
+    assert first is second is third
+    spy.assert_called_once()
+
+
+def test_reset_form_root_cache_forces_the_next_access_to_re_resolve(page, resume_file):
+    page.set_content(CUSTOM_FORM_HTML)
+    adapter = GenericAdapter(page=page, profile=_profile(), resume_document=_resume_document(resume_file))
+
+    with patch("automation.ats.base.resolve_form_root", wraps=base.resolve_form_root) as spy:
+        _ = adapter.form_root
+        adapter.reset_form_root_cache()
+        _ = adapter.form_root
+
+    assert spy.call_count == 2
+
+
+def test_form_root_cache_starts_empty_so_the_very_first_access_still_resolves(page, resume_file):
+    page.set_content(CUSTOM_FORM_HTML)
+    adapter = GenericAdapter(page=page, profile=_profile(), resume_document=_resume_document(resume_file))
+    assert adapter._form_root_cache is None
+    assert adapter.form_root is page

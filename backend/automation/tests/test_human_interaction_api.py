@@ -180,7 +180,7 @@ def _install(monkeypatch, *, task=None, requests=None, delivered=True, resumed=T
     monkeypatch.setattr(hi_api, "audit_log_repository", audit)
     monkeypatch.setattr(hi_api, "deliver_secret", lambda task_id, request_id, value: delivered)
     monkeypatch.setattr(hi_api, "signal_resume", lambda task_id: resumed)
-    monkeypatch.setattr(hi_api, "start_task_background", lambda task_id: None)
+    monkeypatch.setattr(hi_api, "dispatch_autonomous_task", lambda task_id: None)
     monkeypatch.setattr(hi_api, "request_cancel", lambda task_id: True)
     return task, task_repo, human_repo, audit
 

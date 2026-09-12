@@ -9,7 +9,12 @@ vi.mock("../pages/Home", () => ({ default: () => <h1>Your dashboard</h1> }));
 vi.mock("../api", () => ({
   auth: { getToken: vi.fn(), setToken: vi.fn(), clear: vi.fn() },
   setUnauthorizedHandler: vi.fn(),
-  api: { me: vi.fn(), health: vi.fn(), listResumes: vi.fn(), signup: vi.fn(), login: vi.fn() },
+  api: {
+    me: vi.fn(), health: vi.fn(), listResumes: vi.fn(), signup: vi.fn(), login: vi.fn(),
+    // A new signup lands on the profile page (see App.jsx::handleAuthed), so
+    // it needs whatever Profile.jsx loads on mount.
+    getProfile: vi.fn(), listEducation: vi.fn(), listExperience: vi.fn(),
+  },
 }));
 
 function Location() { return <output data-testid="location">{useLocation().pathname}</output>; }
@@ -26,7 +31,7 @@ beforeEach(() => {
 describe("public entry experience", () => {
   it("shows the landing page without requiring authentication or fetching private data", () => {
     open();
-    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Paste a job link. Autogram fills the application.");
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("Your career deserves more than manual applications.");
     expect(screen.queryByLabelText("Password")).not.toBeInTheDocument();
     expect(api.me).not.toHaveBeenCalled();
     expect(api.listResumes).not.toHaveBeenCalled();
@@ -61,13 +66,18 @@ describe("public entry experience", () => {
     expect(screen.getByTestId("location")).toHaveTextContent(/^\/$/);
   });
 
-  it("creates an account from signup and opens the dashboard", async () => {
+  it("creates an account from signup and opens the profile page to upload a resume", async () => {
     api.signup.mockResolvedValue({ access_token: "new-token", email: "new@example.com" });
+    const notFound = Object.assign(new Error("No profile found."), { status: 404 });
+    api.getProfile.mockRejectedValue(notFound);
+    api.listEducation.mockResolvedValue([]);
+    api.listExperience.mockResolvedValue([]);
     open("/signup");
     await userEvent.type(screen.getByLabelText("Email address"), "new@example.com");
     await userEvent.type(screen.getByLabelText("Password"), "password123");
     await userEvent.click(screen.getAllByRole("button", { name: "Create account", exact: true }).find(button => button.type === "submit"));
-    expect(await screen.findByRole("heading", { name: "Your dashboard" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Your master profile" })).toBeInTheDocument();
+    expect(screen.getByText("Upload your resume to get started")).toBeInTheDocument();
     expect(api.signup).toHaveBeenCalledWith("new@example.com", "password123");
     expect(auth.setToken).toHaveBeenCalledWith("new-token");
   });

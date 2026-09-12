@@ -47,11 +47,11 @@ from app.services import autonomous_task_repository as task_repo
 from app.services import human_interaction_repository as human_interaction_repo
 from app.services import profile_repository
 from app.services.event_bus import publish_task_event
+from app.workers.dispatch import dispatch_autonomous_task
 from automation.agents.autonomous.runner import (
     deliver_secret,
     request_cancel,
     signal_resume,
-    start_task_background,
 )
 
 logger = logging.getLogger(__name__)
@@ -317,7 +317,7 @@ def respond_to_human_request(
 
     elif action == "USER_APPROVED":
         if not signal_resume(task.task_id):
-            start_task_background(task.task_id)
+            dispatch_autonomous_task(task.task_id)
         human_interaction_repo.mark_resolved(db, req)
 
     else:  # USER_PROVIDED_VALUE — `value` was validated before the claims
@@ -328,7 +328,7 @@ def respond_to_human_request(
         # too, not just this task's confirmed_answers. Best-effort.
         profile_repository.write_back_stable_answer(db, user.user_id, question, value)
         if not signal_resume(task.task_id):
-            start_task_background(task.task_id)
+            dispatch_autonomous_task(task.task_id)
         human_interaction_repo.mark_resolved(db, req)
 
     return {"request_id": req.request_id, "status": "accepted"}

@@ -6,7 +6,7 @@ from sqlalchemy import text
 
 from app.api import applications, auth, automation, autonomous_agent, chat, human_interaction, metrics, resumes, jobs, profile
 from app.core.auth import get_current_user
-from app.core.config import CORS_ORIGINS, CORS_ORIGIN_REGEX
+from app.core.config import CORS_ORIGINS, CORS_ORIGIN_REGEX, REDIS_URL
 from app.core.database import Base, SessionLocal, engine
 from app.core.middleware import register_middleware
 from app.core.pgvector_setup import ensure_pgvector_extension, ensure_vector_schema
@@ -35,6 +35,15 @@ except Exception:
         "valid Neon connection string (postgresql://...neon.tech/...?sslmode=require)."
     )
     raise
+
+if REDIS_URL is None:
+    logger.warning(
+        "REDIS_URL is not set — the rate limiter and live event bus run "
+        "IN-PROCESS. This is correct for a single uvicorn process only. Do NOT "
+        "run multiple API replicas (or the Phase 2 worker) without Redis: "
+        "rate limits would apply per-process and a WebSocket client on one "
+        "replica would miss events published by another."
+    )
 
 start_scheduler()                 # no-op unless JOB_SYNC_QUERIES is set in .env
 
@@ -86,6 +95,25 @@ app.include_router(chat.router)  # HITL chat transcript + live WebSocket event s
 app.include_router(human_interaction.router)  # HITL OTP/MFA/CAPTCHA/login requests; endpoints take the user dependency individually
 app.include_router(metrics.router)  # cross-engine success-metrics summary; endpoints take the user dependency individually
 app.include_router(jobs.router, dependencies=[Depends(get_current_user)])
+
+
+@app.on_event("shutdown")
+def _log_live_automation_on_shutdown() -> None:
+    """The one place a restart/shutdown of THIS process is directly observable
+    while it's happening, rather than inferred afterwards from an orphaned-task
+    status. An in-process autonomous-task browser (see `runner.py::_REGISTRY`)
+    does not survive this — logging which task ids are about to lose theirs
+    turns "why did my task die" from a DB-forensics exercise into one log line."""
+    from automation.agents.autonomous.runner import list_live_task_ids
+
+    live = list_live_task_ids()
+    if live:
+        logger.warning(
+            "Process shutting down with %d live autonomous-agent task(s) still running in this "
+            "process — their browser session(s) will not survive: %s. Each will be reconciled to "
+            "FAILED the next time a process reconciles orphaned automation.",
+            len(live), live,
+        )
 
 
 @app.get("/health")

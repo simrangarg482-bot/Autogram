@@ -7,6 +7,20 @@ from app.core.database import Base
 
 EMBEDDING_DIM = 384  # all-MiniLM-L6-v2 output size
 
+# Phase 0 (PLATFORM_ROADMAP.md) — account-level RBAC.
+# `role` gates privileged surfaces (moderator = community moderation controls,
+# admin = the separate admin console). A single column, not a `user_roles`
+# table: there are no scoped/per-resource permissions yet, and one enum is far
+# easier to reason about. The JWT carries `role` as a hint for the frontend,
+# but `get_current_user` always re-reads this column — the DB row is the
+# authority, a tampered token claim changes nothing.
+VALID_USER_ROLES = {"member", "moderator", "admin"}
+# `status` is the moderation/lifecycle state. `suspended` is meant to be
+# time-boxed (a cooling-off period), `banned` is indefinite; both block every
+# authenticated request at `get_current_user` with a clear reason. Community
+# moderation (Phase 11) and the admin console (Phase 13) are the only writers.
+VALID_USER_STATUSES = {"active", "suspended", "banned"}
+
 VALID_MATCH_STATUSES = {"new", "saved", "dismissed"}
 VALID_REMOTE_PREFERENCES = {"remote", "hybrid", "onsite", "no_preference"}
 VALID_DOCUMENT_TYPES = {"resume", "cover_letter", "certificate", "other"}
@@ -85,6 +99,27 @@ class User(Base):
     user_id = Column(String, primary_key=True)
     email = Column(String, nullable=False, unique=True, index=True)
     password_hash = Column(String, nullable=False)  # salted PBKDF2, never plaintext
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    # Phase 0 RBAC — see VALID_USER_ROLES / VALID_USER_STATUSES above.
+    role = Column(String, nullable=False, server_default="member", default="member")
+    status = Column(String, nullable=False, server_default="active", default="active")
+
+
+class PasswordResetToken(Base):
+    """A single-use, short-lived token issued by POST /auth/forgot-password.
+
+    Only a SHA-256 hash of the token is stored — the raw value exists only in
+    the emailed link, so a DB read (backup, dump, compromised replica) can
+    never be replayed into a password reset. `used_at` set enforces single-use;
+    `expires_at` bounds the reset window regardless of use.
+    """
+    __tablename__ = "password_reset_tokens"
+
+    token_id = Column(String, primary_key=True)
+    user_id = Column(String, ForeignKey("users.user_id", ondelete="CASCADE"), nullable=False, index=True)
+    token_hash = Column(String, nullable=False, unique=True, index=True)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 

@@ -48,10 +48,32 @@ export default function ResumeManagement({ toast }) {
       const doc = await api.uploadDocument(file, { documentType: uploadType, jobTypeTag: jobTypeTag || undefined });
       setDocuments((docs) => [doc, ...docs.filter((d) => d.document_id !== doc.document_id)]);
       toast(`${doc.original_filename} uploaded.`, "success");
+      // First résumé for a brand-new user: jump straight into the pre-filled
+      // review step instead of making them find and click "Build profile"
+      // themselves. `upload_document` auto-creates an empty profile row on
+      // the very first upload (so there's always SOME row by now — a 404
+      // check here would never fire), so "new user" is judged by whether
+      // that profile still has no identity info in it, not by existence.
+      // Anyone who already has a filled-in profile keeps the manual button —
+      // uploading a second/third résumé variant shouldn't yank them away
+      // from this page every time.
+      if (uploadType === "resume" && (await isProfileEmpty())) {
+        await buildProfile(doc);
+      }
     } catch (e) {
       toast(e.message, "error");
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function isProfileEmpty() {
+    try {
+      const p = await api.getProfile();
+      return !p.full_name && !p.email && !p.phone;
+    } catch (e) {
+      if (e.status === 404) return true;
+      return false; // unexpected error — don't misfire the auto-redirect over it
     }
   }
 

@@ -68,6 +68,7 @@ import re
 import time
 from dataclasses import dataclass, field as _dc_field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Callable
 
 from playwright.sync_api import BrowserContext, Error as PlaywrightError, Locator, Page
@@ -87,6 +88,8 @@ from automation.ats.generic.generic_adapter import GenericAdapter
 from automation.ats.registry import get_adapter_class
 from automation.browser.browser_manager import BrowserManager
 from automation.applications import verification_channel
+from automation.applications.application_state import ApplicationState
+from automation.applications.cover_letter import generate_cover_letter_text, write_cover_letter_docx
 from automation.browser.selectors import (
     VERIFICATION_CODE_INPUT_SELECTOR,
     find_apply_entry_button,
@@ -393,6 +396,7 @@ class ApplicationFlowManager:
         adapter_cls: type[ATSAdapter] | None,
         profile: CandidateProfile,
         resume_document: ProfileDocument,
+        job_description: str | None = None,
         autopilot_enabled: bool = False,
         browser_manager: BrowserManager | None = None,
         headless: bool | None = None,
@@ -422,6 +426,24 @@ class ApplicationFlowManager:
         self.adapter_cls = adapter_cls
         self.profile = profile
         self.resume_document = resume_document
+        # Cover letter generation (see automation/applications/cover_letter.py):
+        # the same optional job-description hint `ApplicationAnswerEngine`
+        # already gets from `app/api/applications.py::_run_application` — a
+        # bare pasted URL with no hint means `None`, and a cover-letter field
+        # found on the page is then simply left unfilled (see
+        # `_generate_cover_letter`) rather than inventing a job description.
+        self.job_description = job_description
+        # Generated at most once per run (see `_handle_cover_letter_if_requested`),
+        # even across a multi-page form that asks for one more than once.
+        self._cover_letter_text: str | None = None
+        self._cover_letter_generation_attempted = False
+        # Set only if some page's cover-letter field turned out to be a file
+        # upload — a plain local temp file (see `cover_letter.write_cover_letter_docx`),
+        # never a `ProfileDocument`/`StorageBackend` write. Deleted once this
+        # run is over regardless of outcome (`_cleanup_cover_letter_file`);
+        # the user's real résumé/profile documents are never touched by any
+        # of this.
+        self._cover_letter_temp_path: str | None = None
         self.autopilot_enabled = autopilot_enabled
         # Phase 6: optional. `None` (the default) means every labeled
         # question FieldMapper can't match is simply left unfilled — exactly
@@ -466,6 +488,13 @@ class ApplicationFlowManager:
         # (e.g. 0) to get the same code path with an effectively immediate
         # timeout.
         self.human_wait_timeout_s = human_wait_timeout_s
+        # Application State (see automation/applications/application_state.py):
+        # one coherent, inspectable object tracking current/completed pages,
+        # every field's latest outcome, which fields still need a human's
+        # input and why, current validation errors, and a decision timeline
+        # — fed from the same events `checkpoint()`/`_process_page()` already
+        # produce, not a second, competing source of truth.
+        self.state = ApplicationState(application_id=application_id)
         self._steps_completed: list[str] = []
         # Set once `_run_on_page` constructs an adapter for this run — see
         # `_finish_browser_session`, which reads these to populate
@@ -496,14 +525,19 @@ class ApplicationFlowManager:
         Also updates `LIVE_RUN_STATE` (§10 Live Automation View) — every
         checkpoint is a point-in-time snapshot of "what is this run doing
         right now", which is exactly what `GET /applications/{id}/live`
-        polls."""
+        polls. Also feeds `self.state` (see `automation.applications.
+        application_state.ApplicationState`) — the same event, recorded as
+        one more entry in the run's own structured decision timeline rather
+        than only the single most recent step name."""
         self._steps_completed.append(step_name)
         logger.info("application %s: step '%s' complete", self.application_id, step_name)
+        self.state.record_decision(step_name, page_number=page_number)
         state = LIVE_RUN_STATE.setdefault(self.application_id, {})
         state["last_step"] = step_name
         if page_number is not None:
             state["page_number"] = page_number
         state["updated_at"] = datetime.now(timezone.utc).isoformat()
+        state["application_state"] = self.state.snapshot()
 
     # `detect_next_step()` used to live here and is deliberately gone: which
     # control advances the form is now `ATSAdapter.find_next_control()`, so a
@@ -623,6 +657,13 @@ class ApplicationFlowManager:
             # included so `POST /applications/{id}/approve` can later replay a
             # submit click against this exact page (`submit_open_review_session`).
             _OPEN_REVIEW_SESSIONS[self.application_id] = (self.browser_manager, self._last_adapter, self._last_page)
+            # Safe even though the browser stays open: the browser already has
+            # whatever bytes it needed from the temp cover-letter file the
+            # moment `set_input_files` returned, and a later resume (e.g. a
+            # human fixes something and the run continues) builds a fresh
+            # `ApplicationFlowManager` that generates its own temp file again
+            # if it needs one — nothing depends on this path surviving.
+            self._cleanup_cover_letter_file()
             return
 
         logger.info(
@@ -630,6 +671,12 @@ class ApplicationFlowManager:
             self.application_id, status, self.browser_manager.active_mode,
         )
         self.browser_manager.close()
+        # This run is done, one way or another (this branch is the ONE place
+        # that's true regardless of status — see `should_keep_browser_open`).
+        # The browser already has whatever bytes it needed from the temp
+        # cover-letter file the moment `set_input_files` returned, so nothing
+        # ever reads this path again after this point — safe to delete now.
+        self._cleanup_cover_letter_file()
 
     # ------------------------------------------------------------------
     # Internals
@@ -818,10 +865,18 @@ class ApplicationFlowManager:
         # isn't "low confidence" — it's "automation cannot proceed without a
         # human," regardless of how well everything else filled. Checked
         # (and reported by name) before ever considering AUTO_SUBMIT.
-        missing_required = self._still_missing_required(page, vision_confirmed_filled)
+        # `adapter.form_root` (not the raw top-level `page`): some ATS
+        # platforms render their form inside an iframe (iCIMS, confirmed
+        # live — see `automation.browser.selectors.resolve_form_root`), so
+        # scanning `page` directly would find every required field "missing"
+        # simply because none of them are visible from the top-level
+        # document at all — not because the candidate's profile genuinely
+        # has nothing to offer them.
+        missing_required = self._still_missing_required(adapter.form_root, vision_confirmed_filled)
         if missing_required:
             reason = f"Required field(s) could not be filled — no value available in the candidate's profile: {', '.join(missing_required)}."
             logger.info("application %s: %s", self.application_id, reason)
+            self.state.record_missing_required(missing_required, page_number=pages_processed)
             self.checkpoint("manual_required_missing_fields")
             return ApplicationRunResult(
                 application_id=self.application_id,
@@ -840,7 +895,8 @@ class ApplicationFlowManager:
         # character limit, rejected file type) — never something to submit
         # over, and not something automation can resolve on its own, since
         # the value came from the candidate's own profile.
-        validation_errors = find_validation_errors(page)
+        validation_errors = find_validation_errors(adapter.form_root)
+        self.state.record_validation_errors(validation_errors)
         if validation_errors:
             reason = f"Validation errors remain on the form: {'; '.join(validation_errors)}."
             logger.info("application %s: %s", self.application_id, reason)
@@ -933,6 +989,19 @@ class ApplicationFlowManager:
         gates SUBMISSION, not the fields themselves, so a human is asked to
         solve it only once there is nothing left for automation to usefully
         do on this page, not before a single field has been typed."""
+        # Application State: everything appended to `all_results` from here
+        # to this method's `return` belongs to THIS page — recorded as one
+        # batch at the bottom (`self.state.record_page_results`), not
+        # trickled in per-call, so a mid-page early return (a human gate, a
+        # CAPTCHA) still reports whatever this page actually got done before
+        # it stopped.
+        results_start = len(all_results)
+        # `adapter.form_root` (automation/ats/base.py) is cached for the
+        # duration of one page — reset it here, once, before anything on
+        # this page is scanned, so a later page that switches between
+        # rendering directly and rendering inside an iframe (or vice versa)
+        # is still resolved fresh rather than reusing the previous page's root.
+        adapter.reset_form_root_cache()
         wait_for_page_settled(page)
 
         dismissed = adapter.dismiss_distractions()
@@ -957,6 +1026,7 @@ class ApplicationFlowManager:
             self.checkpoint("human_gate_detected", page_number=page_index + 1)
             logger.info("application %s: %s", self.application_id, reason)
             if not self._wait_for_human(page_index, reason, lambda: find_human_gate(page) is None, page=page):
+                self.state.record_page_results(page_index + 1, all_results[results_start:])
                 return _PageProgress(signature=capture_page_signature(page), blocked_reason=reason)
             wait_for_page_settled(page)
 
@@ -975,6 +1045,15 @@ class ApplicationFlowManager:
             all_results.append(self._upload_resume(adapter))
         else:
             self._upload_resume_if_offered(adapter, page_index, all_results)
+
+        # Cover letter: only if THIS page actually asks for one (see
+        # `ATSAdapter.detect_cover_letter_field`) — the common case is no
+        # field at all, in which case this does nothing. Checked before
+        # `_fill_page` for the same reason résumé upload is: whichever field
+        # it finds must be claimed (and marked examined) before the generic
+        # label/name sweep below gets a chance to treat it as an ordinary,
+        # unmapped screening question.
+        self._handle_cover_letter_if_requested(adapter, page_index, all_results)
 
         signature = self._fill_page(adapter, page, page_index, all_results)
 
@@ -998,11 +1077,13 @@ class ApplicationFlowManager:
             reason = "CAPTCHA present — a human must solve it; automation never will."
             logger.info("application %s: CAPTCHA detected on page %d.", self.application_id, page_index + 1)
             if not self._wait_for_human(page_index, reason, lambda: not page_has_captcha(page)):
+                self.state.record_page_results(page_index + 1, all_results[results_start:])
                 return _PageProgress(signature=signature, blocked_reason=reason)
             wait_for_page_settled(page)
             signature = capture_page_signature(page)
 
         is_final = self._safe_is_final_page(adapter)
+        self.state.record_page_results(page_index + 1, all_results[results_start:])
         return _PageProgress(signature=signature, is_final=is_final, vision_confirmed=vision_confirmed)
 
     def _fill_page(
@@ -1113,6 +1194,91 @@ class ApplicationFlowManager:
         existing.filled = uploaded.filled
         existing.failure = uploaded.failure
 
+    def _handle_cover_letter_if_requested(
+        self, adapter: ATSAdapter, page_index: int, all_results: list[FieldFillResult],
+    ) -> None:
+        """Generates and fills a cover letter — but only if this page's
+        `detect_cover_letter_field()` finds a real field asking for one.
+        Most applications never do, and this is then a no-op.
+
+        Generation is attempted at most once per run (`self._cover_letter_text`
+        is cached the first time), even across a multi-page form that offers
+        a cover-letter field more than once."""
+        kind, locator = adapter.detect_cover_letter_field()
+        if kind is None or locator is None:
+            return
+
+        if not self._cover_letter_generation_attempted:
+            self._cover_letter_generation_attempted = True
+            self._cover_letter_text = self._generate_cover_letter()
+
+        if not self._cover_letter_text:
+            # No job description to ground it in, or generation failed —
+            # leave the field empty rather than invent a letter. If it was
+            # required, the existing missing-required-field/validation
+            # checks catch it exactly like any other field automation
+            # couldn't answer — no special-casing needed here.
+            return
+
+        if kind == "file":
+            value = self._cover_letter_file_path()
+            if value is None:
+                return
+        else:
+            value = self._cover_letter_text
+
+        result = adapter.fill_cover_letter_field(locator, value)
+        all_results.append(result)
+        self.checkpoint(
+            "cover_letter_filled" if result.filled else "cover_letter_fill_failed", page_number=page_index + 1,
+        )
+
+    def _generate_cover_letter(self) -> str | None:
+        if not self.job_description or not self.job_description.strip():
+            logger.info(
+                "application %s: a cover letter was requested but no job description is available for this "
+                "run — leaving it unfilled.", self.application_id,
+            )
+            return None
+        try:
+            text = generate_cover_letter_text(profile=self.profile, job_description=self.job_description)
+        except Exception:  # noqa: BLE001 - a failed generation must never fail the whole run
+            logger.exception("application %s: cover letter generation failed — leaving it unfilled.", self.application_id)
+            return None
+        logger.info("application %s: cover letter generated.", self.application_id)
+        self.checkpoint("cover_letter_generated")
+        return text
+
+    def _cover_letter_file_path(self) -> str | None:
+        """The generated letter as a local temp `.docx` file, created the
+        FIRST time a page's cover-letter field turns out to be a file
+        upload — cached afterward so a multi-page form asking for the file
+        more than once reuses the same one rather than regenerating it.
+        Cleaned up in `_cleanup_cover_letter_file` once the run is over."""
+        if self._cover_letter_temp_path is not None:
+            return self._cover_letter_temp_path
+        try:
+            self._cover_letter_temp_path = write_cover_letter_docx(self._cover_letter_text)
+        except Exception:  # noqa: BLE001 - never let a temp-file failure fail the run
+            logger.exception("application %s: could not create a temporary cover letter file.", self.application_id)
+            return None
+        return self._cover_letter_temp_path
+
+    def _cleanup_cover_letter_file(self) -> None:
+        """Deletes the temporary cover-letter file (if one was ever created)
+        once this run is over, win or lose — see `_finish_browser_session`,
+        the one place this is called from. Never touches `self.resume_document`
+        or anything in the user's Master Profile; this only ever deletes the
+        one temp path this same run created for itself."""
+        if self._cover_letter_temp_path is None:
+            return
+        try:
+            Path(self._cover_letter_temp_path).unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001 - best-effort cleanup, never raise from here
+            logger.debug("application %s: could not delete the temporary cover letter file.", self.application_id)
+        finally:
+            self._cover_letter_temp_path = None
+
     # ------------------------------------------------------------------
     # Navigation between pages
     # ------------------------------------------------------------------
@@ -1191,7 +1357,7 @@ class ApplicationFlowManager:
         if adapter.dismiss_distractions():
             changed = True
 
-        blocking = outcome.validation_errors or find_unfilled_required_fields(page)
+        blocking = outcome.validation_errors or find_unfilled_required_fields(adapter.form_root)
         if blocking:
             before = capture_page_signature(page)
             round_results = adapter.answer_questions()

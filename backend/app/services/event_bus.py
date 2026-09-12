@@ -1,23 +1,21 @@
 """
-In-process publish/subscribe for live workflow events.
+Publish/subscribe for live workflow events.
 
-## Why in-process, and not Redis/a queue
+## Transport: in-process, mirrored to Redis when configured (Phase 1)
 
-The same reason `runner.py::_REGISTRY` and `app/core/middleware.py`'s rate
-limiter are in-process: this project runs a single uvicorn worker. That is a
-verified property, not an assumption — `requirements.txt` ships
-`uvicorn[standard]` and no other HTTP server, there is no
-Dockerfile/Procfile/k8s manifest/`--workers`/`WEB_CONCURRENCY` anywhere, and
-the pause/resume design already REQUIRES it (a paused task can only be resumed
-by the process holding its `TaskHandle`). Adding a broker here would introduce
-infrastructure the rest of the system cannot yet use, to solve a problem this
-deployment does not have.
+Every `publish` fans out to this process's local subscribers immediately. When
+`REDIS_URL` is set the event is ALSO published to a Redis channel, and every
+API process runs one listener (`start_redis_listener`) that re-injects events
+originating elsewhere into its own local subscribers. Net effect: a WebSocket
+client on replica A sees events published by replica B (or, Phase 2, by the
+worker process). The origin process tags each message and skips its own
+loopback, so an event is delivered to any given subscriber exactly once.
 
-If a second worker is ever introduced, this degrades the same way `_REGISTRY`
-does: a client connected to worker A stops seeing events published by worker B.
-It never corrupts state — every durable fact still lives in Postgres, and the
-frontend's existing polling remains the fallback — but the live stream would
-need the same Celery/Redis migration `runner.py`'s docstring tracks.
+With `REDIS_URL` unset the Redis path is simply inert and delivery is
+in-process only — correct for a single process, which `app/main.py` warns
+about at startup.
+
+This never becomes a source of truth either way — see below.
 
 ## Delivery guarantees, stated plainly
 
@@ -49,12 +47,24 @@ would be a race at best and a silent no-op at worst.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 
 logger = logging.getLogger(__name__)
+
+#: Redis pub/sub channel namespace. One channel per stream_id; the listener
+#: pattern-subscribes to all of them.
+_REDIS_CHANNEL_PREFIX = "autogram:events:"
+_REDIS_CHANNEL_PATTERN = _REDIS_CHANNEL_PREFIX + "*"
+
+#: Identifies this process so the Redis listener can skip events it published
+#: itself (they were already delivered to local subscribers synchronously).
+_PROCESS_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 #: The complete live-event vocabulary. This is a CONTRACT, not documentation:
 #: the frontend switches on these names, and a typo in a publish call would
@@ -74,6 +84,7 @@ WORKFLOW_EVENTS = frozenset({
     "APPLICATION_FAILED",
     "APPLICATION_READY_FOR_SUBMISSION",
     "REVIEW_REQUIRED",
+    "DOCUMENT_ATTACHED",
     # Human-in-the-loop
     "HUMAN_ACTION_REQUIRED",
     "HUMAN_ACTION_COMPLETED",
@@ -149,6 +160,11 @@ class EventBus:
         # non-async worker threads that have no event loop of their own.
         self._lock = Lock()
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._redis_listener_task: asyncio.Task | None = None
+        # Tags events this instance mirrors to Redis so its own listener skips
+        # the loopback. Per-instance (not just the module constant) so a test
+        # can stand up two buses that behave like two processes.
+        self._origin = _PROCESS_ID
 
     def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Remember the serving event loop so `publish` can hop onto it from a
@@ -160,6 +176,9 @@ class EventBus:
         queue: asyncio.Queue = asyncio.Queue(maxsize=_MAX_QUEUED_EVENTS)
         try:
             self.bind_loop(asyncio.get_running_loop())
+            # First subscriber on this loop also starts the cross-process
+            # listener (no-op if Redis is unconfigured or already running).
+            self._ensure_redis_listener()
         except RuntimeError:  # pragma: no cover - subscribe is always called from async code
             pass
         with self._lock:
@@ -188,6 +207,10 @@ class EventBus:
         must never propagate into — let alone abort — a real job application, so
         every delivery problem is swallowed and logged rather than raised.
         """
+        # Cross-process mirror first, so an event still reaches other replicas
+        # even when this process has no local subscriber for it.
+        self._mirror_to_redis(event)
+
         with self._lock:
             queues = list(self._subscribers.get(event.stream_id, ()))
             loop = self._loop
@@ -199,6 +222,77 @@ class EventBus:
             except RuntimeError:
                 # The loop is closing/closed (shutdown, or a test that finished).
                 logger.debug("Event bus: loop unavailable for %s.", event.event_type)
+
+    # ---------- cross-process (Redis) ----------
+
+    def _mirror_to_redis(self, event: WorkflowEvent) -> None:
+        """Publish the event to Redis for other processes. Best-effort and
+        synchronous (callers are worker threads); any failure is logged, never
+        raised — same contract as local delivery."""
+        from app.core.redis_client import sync_redis
+
+        client = sync_redis()
+        if client is None:
+            return
+        try:
+            client.publish(
+                _REDIS_CHANNEL_PREFIX + event.stream_id,
+                json.dumps({"origin": self._origin, "event": event.to_json()}),
+            )
+        except Exception:  # noqa: BLE001 - notification transport must never raise into automation
+            logger.warning("Event bus: Redis publish failed for %s.", event.event_type, exc_info=True)
+
+    def _ensure_redis_listener(self) -> None:
+        from app.core.redis_client import async_redis
+
+        if self._redis_listener_task is not None and not self._redis_listener_task.done():
+            return
+        if async_redis() is None:
+            return
+        self._redis_listener_task = asyncio.get_running_loop().create_task(self._redis_listen())
+        logger.info("Event bus: Redis cross-process listener started (%s).", self._origin)
+
+    async def _redis_listen(self) -> None:
+        """Re-inject events published by OTHER processes into local subscribers.
+        Reconnects with backoff; a Redis blip degrades to in-process-only until
+        it recovers, never crashes the process."""
+        from app.core.redis_client import async_redis
+
+        backoff = 1.0
+        while True:
+            try:
+                client = async_redis()
+                if client is None:  # pragma: no cover - listener isn't started in this case
+                    return
+                pubsub = client.pubsub()
+                await pubsub.psubscribe(_REDIS_CHANNEL_PATTERN)
+                backoff = 1.0
+                async for message in pubsub.listen():
+                    if message.get("type") != "pmessage":
+                        continue
+                    self._deliver_from_redis(message.get("data"))
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - keep the listener alive across Redis outages
+                logger.warning("Event bus: Redis listener error, retrying in %.0fs.", backoff, exc_info=True)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+
+    def _deliver_from_redis(self, raw: str | None) -> None:
+        try:
+            envelope = json.loads(raw or "")
+            if envelope.get("origin") == self._origin:
+                return  # our own event — already delivered locally
+            body = envelope["event"]
+            event = WorkflowEvent(body["stream_id"], body["event"], body.get("payload") or {})
+        except (ValueError, KeyError, TypeError):
+            logger.warning("Event bus: undecodable Redis message dropped.", exc_info=True)
+            return
+        # Already on the event loop (the listener runs on it), so offer directly.
+        with self._lock:
+            queues = list(self._subscribers.get(event.stream_id, ()))
+        for queue in queues:
+            self._offer(queue, event)
 
     @staticmethod
     def _offer(queue: asyncio.Queue, event: WorkflowEvent) -> None:

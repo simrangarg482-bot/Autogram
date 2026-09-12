@@ -16,6 +16,7 @@ from typing import Any
 
 from automation.agents.autonomous.actions import AgentAction, InvalidActionError
 from automation.agents.autonomous.observer import PageState
+from automation.agents.autonomous.field_coverage import unresolved_fields
 from automation.interfaces import LLMRouterError, generate_answer
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,13 @@ Grounding rules:
 - On a JOB_LISTING, click the observed APPLY or START_APPLICATION element_ref.
 - APPLY/START_APPLICATION opens an application; it is not final SUBMIT.
 - SUBMIT is only a final-review action and requires explicit user approval.
+- Multi-page applications: complete the current step using sourced answers, then click the observed NEXT, CONTINUE, SAVE_AND_CONTINUE, or REVIEW control. These intermediate actions do not require final submission approval.
+- After each transition, inspect the freshly observed fields and their values. Continue through every step, even when the URL stays the same. Do not reuse element refs from a previous step.
+- If a step did not advance, inspect validation messages, correct supported answers, or ask for missing information; do not repeatedly click the same control. Preserve already completed fields.
+- Do not declare the application ready merely because one page is filled. Reach the final review/submission step first.
+- Account for EVERY editable application field, including optional questions. Fill supported values; for missing facts ask the user with information_required set to the exact field label, then use their confirmed answer and continue. Never silently skip an optional question. If the user explicitly says "leave blank" for an optional field, respect that choice.
+- A dropdown search string is not a selected answer: select an observed option and verify the committed selection. Read selected_options before changing a dropdown already filled. Re-observe after answers reveal conditional fields.
+- Policy acknowledgements, arbitration agreements and consent require the user's confirmation. Do not infer acceptance from their request to fill the application.
 - A navigate URL must be an observed href, the original/canonical URL, or an explicitly allow-listed destination. Never construct /apply, /application, or any other guessed URL.
 - A same-page no-op or error page is a failed action.
 """
@@ -191,6 +199,10 @@ def _build_user_prompt(
         "uploaded_documents_available_for_upload_actions": uploaded_documents or [],
         "auto_submit_explicitly_approved_by_user": auto_submit_approved,
         "current_browser_state": page_state.as_dict(),
+        "unresolved_application_fields": [
+            {"ref": e.ref, "label": e.name, "required": e.required}
+            for e in unresolved_fields(page_state, confirmed_answers)
+        ],
         "observed_actions": observed_actions,
         "recent_action_history": recent_actions,
     }

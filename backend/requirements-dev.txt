@@ -2,5 +2,6 @@
 
 pytest
 moto[s3]
+fakeredis>=2.21     # in-memory Redis for rate-limiter + event-bus tests (Phase 1)
 ruff
 mypy
