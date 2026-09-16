@@ -72,6 +72,7 @@ def create_task(
         application_progress={},
         confirmed_answers={},
         field_attempt_ledger={},
+        question_ledger={},
         # The `upload_file` allowlist for this task — see
         # `app/api/autonomous_agent.py::_build_uploadable_documents`.
         uploaded_documents=uploaded_documents or [],
@@ -163,6 +164,29 @@ def record_field_attempt(db: Session, task: AutonomousTask, field_identity: str,
     db.commit()
     db.refresh(task)
     return task
+
+
+def record_question_ledger_entry(db: Session, task: AutonomousTask, key: str, entry: dict) -> None:
+    """Upserts one field's entry in `question_ledger` — the autonomous path's
+    per-question record of what was asked, what was answered, from which
+    provenance, and whether a human still has to look at it (see
+    `automation/agents/autonomous/question_ledger.py`).
+
+    `key` is an `observer.field_identity`, the same stable key
+    `field_attempt_ledger` uses, so the two ledgers line up field-for-field;
+    `entry` is a `QuestionLedgerEntry.as_dict()`. Reassigns the whole dict
+    (the same pattern `record_field_attempt`/`append_action` use) so
+    SQLAlchemy's JSONB change-tracking, which does not see in-place mutation
+    of a mutable Python object, reliably flags the column dirty.
+
+    Returns `None` rather than the task: this is pure bookkeeping on the
+    loop's hot path and its callers never use a return value."""
+    ledger = dict(task.question_ledger or {})
+    ledger[key] = entry
+    task.question_ledger = ledger
+    task.updated_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(task)
 
 
 def update_progress(db: Session, task: AutonomousTask, progress: dict) -> AutonomousTask:

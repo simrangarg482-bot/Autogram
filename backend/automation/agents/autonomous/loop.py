@@ -24,7 +24,7 @@ from __future__ import annotations
 import base64
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field as dc_field
 
 from playwright.sync_api import Page
 
@@ -34,10 +34,22 @@ from app.services import chat_repository
 from app.services.event_bus import publish_task_event
 from app.services import human_interaction_repository as human_interaction_repo
 from app.services.autonomous_task_repository import TerminalTaskError
+from automation.agents.autonomous import recovery
+from automation.agents.autonomous.action_semantics import is_submit_control_name
 from automation.agents.autonomous.actions import ActionResult, AgentAction, validate_action_grounding
+from automation.agents.autonomous.budgets import BudgetTracker
 from automation.agents.autonomous.decision import Decision, DecisionError, decide_next_step, normalize_intervention_type
 from automation.agents.autonomous.executor import ActionExecutor, is_verification_code_field_name
 from automation.agents.autonomous.field_coverage import unresolved_fields
+from automation.agents.autonomous.page_classifier import classify_page
+from automation.agents.autonomous.page_graph import PageGraph
+from automation.agents.autonomous.question_ledger import QuestionLedger, QuestionLedgerEntry
+from automation.agents.autonomous.question_ontology import classify_field
+from automation.agents.autonomous.state_machine import (
+    validate_coarse_transition,
+    validate_substate_transition,
+)
+from automation.agents.autonomous.truth_store import TruthStore, decide as decide_answer
 from automation.agents.autonomous.observer import (
     CONFIRMATION_PHRASES,
     PageState,
@@ -147,6 +159,39 @@ class TaskHandle:
     last_unverified_ref: int | None = None
     unverified_streak: int = 0
 
+    # ---- spec §11/§12/§7: additive, in-process-only agent state, same
+    # lifetime as everything above (never persisted except where noted) ----
+    #: Additional, configurable cost/risk ceilings for ONE run
+    #: (`budgets.py`). These are layered ON TOP OF — never in place of —
+    #: `MAX_ITERATIONS_PER_RESUME` and `MAX_FIELD_ATTEMPTS`, both of which
+    #: keep their exact original values and enforcement points below.
+    budgets: BudgetTracker = dc_field(default_factory=BudgetTracker)
+    #: Dynamic map of page signatures visited and the actions that moved
+    #: between them (`page_graph.py`). Observability/planning support only —
+    #: nothing in this file gates on it.
+    page_graph: PageGraph = dc_field(default_factory=PageGraph)
+    #: Per-question ledger (`question_ledger.py`), rehydrated from
+    #: `AutonomousTask.question_ledger` on the first iteration of a run and
+    #: written through to that column alongside — never instead of — the
+    #: existing `field_attempt_ledger` bookkeeping.
+    question_ledger: QuestionLedger = dc_field(default_factory=QuestionLedger)
+    #: Whether `question_ledger` above has been rehydrated from the DB yet.
+    question_ledger_loaded: bool = False
+    #: The finer, in-memory sub-state (`state_machine.SUBSTATES`) the loop is
+    #: currently in. Advisory/audit only — `STRICT_MODE = False` there, so an
+    #: unexpected transition is logged, never raised or blocked.
+    substate: str | None = None
+    #: Per-failure-code retry counters for `recovery.recovery_policy`'s
+    #: bounded-RETRY accounting, keyed by failure code.
+    recovery_attempts: dict = dc_field(default_factory=dict)
+    #: Same-process half of the submit-in-flight marker (spec §6/§10). The
+    #: DURABLE half lives in `AutonomousTask.application_progress
+    #: ["submit_in_flight"]`, which is what survives a crash; this one is the
+    #: backstop for the case where the durable write itself could not land.
+    #: Once set, no submit-intent click may be dispatched again for the rest
+    #: of this run — see `_handle_execute_action`'s submit guard.
+    submit_outcome_unknown: bool = False
+
 
 class AutonomousAgentLoop:
     def __init__(self, task_id: str, handle: TaskHandle):
@@ -171,7 +216,7 @@ class AutonomousAgentLoop:
             publish_task_event(task.task_id, "APPLICATION_STARTED")
             try:
                 self._ensure_browser(task)
-                task_repo.set_status(db, task, "RUNNING")
+                self._set_status(db, task, "RUNNING")
                 self._loop_body(db, task)
             except TerminalTaskError as e:
                 # The task reached a terminal status (most likely: a
@@ -232,27 +277,42 @@ class AutonomousAgentLoop:
             return  # already open (a resume) — reuse the SAME tab/session
         logger.info("Task %s: launching browser context.", self.task_id)
         manager = BrowserManager(user_id=task.user_id, ats_platform="autonomous_agent")
-        manager.launch_context()
-        page = manager.new_page()
-        logger.info(
-            "Task %s: browser context ready (mode=%s) — navigating to %s.",
-            self.task_id, manager.active_mode, task.job_url,
-        )
-        navigation = ActionExecutor(page, auto_submit_approved=False).execute(
-            AgentAction(action_type="navigate", url=task.job_url)
-        )
-        if not navigation.success or not navigation.verified:
-            logger.warning("Task %s: initial navigation failed — %s", self.task_id, navigation.detail)
-            manager.close()
-            raise BrowserAutomationError(navigation.detail)
+        # Until `manager` is published onto the handle below, `_close_browser`
+        # cannot see it — so EVERY exit from this block that isn't a fully
+        # successful launch has to close it here. The failed-navigation branch
+        # always did; a `new_page()`/`launch_context()`/executor raise did not,
+        # and leaked a live Playwright driver process per failed start (the
+        # same leak `_wait_for_resume`'s docstring describes running the
+        # real-browser E2E suite out of browsers).
+        try:
+            manager.launch_context()
+            page = manager.new_page()
+            logger.info(
+                "Task %s: browser context ready (mode=%s) — navigating to %s.",
+                self.task_id, manager.active_mode, task.job_url,
+            )
+            navigation = ActionExecutor(page, auto_submit_approved=False).execute(
+                AgentAction(action_type="navigate", url=task.job_url)
+            )
+            if not navigation.success or not navigation.verified:
+                logger.warning("Task %s: initial navigation failed — %s", self.task_id, navigation.detail)
+                raise BrowserAutomationError(navigation.detail)
+        except BaseException:
+            _safe_close(manager, self.task_id)
+            raise
         logger.info("Task %s: navigation complete — page loaded at %s.", self.task_id, page.url)
         self.handle.browser_manager = manager
         self.handle.page = page
 
     def _close_browser(self) -> None:
+        """Releases the browser on EVERY exit path. A failure to close must
+        never propagate: `run()` calls this from inside its own `except`
+        blocks, so a raising `close()` there would replace the real error
+        with a teardown one AND leave the handle still pointing at a manager
+        nobody will ever close again."""
         if self.handle.browser_manager is not None:
             logger.info("Task %s: closing browser context.", self.task_id)
-            self.handle.browser_manager.close()
+            _safe_close(self.handle.browser_manager, self.task_id)
         self.handle.browser_manager = None
         self.handle.page = None
 
@@ -273,10 +333,426 @@ class AutonomousAgentLoop:
         except Exception:  # noqa: BLE001
             return None
 
+    # ---- additive agent-state helpers (spec §6/§11/§12) ------------------
+    #
+    # Every method in this block is ADVISORY or BOOKKEEPING only, with the
+    # single exception of `_check_budgets`, which routes into the loop's
+    # ALREADY EXISTING pause/fail paths (`_pause_for_human` /
+    # `_safe_mark_failed`) rather than inventing a new terminal state.
+
+    def _set_status(self, db, task, status: str):
+        """`task_repo.set_status` with a `state_machine.validate_coarse_transition`
+        check logged alongside it. `STRICT_MODE = False` in that module, so an
+        unrecognized transition is a WARNING and the write proceeds exactly as
+        it did before — the repository's own `_guard_not_terminal` remains the
+        only thing that can refuse a status write."""
+        previous = task.current_status
+        try:
+            check = validate_coarse_transition(previous, status)
+            if not check.allowed:
+                logger.warning(
+                    "Task %s: coarse status transition %s -> %s is not in the known graph (%s) — "
+                    "proceeding (advisory check only).", self.task_id, previous, status, check.reason,
+                )
+        except Exception:  # noqa: BLE001 — an advisory check must never break a status write
+            logger.debug("Task %s: coarse transition check failed.", self.task_id, exc_info=True)
+        return task_repo.set_status(db, task, status)
+
+    def _set_substate(self, substate: str) -> None:
+        """Records the finer observe/decide/act/verify sub-state
+        (`state_machine.SUBSTATES`). In-memory + logged only: no DB column, no
+        raising, no control-flow effect. Notably this never CLEARS
+        `UNKNOWN_SUBMISSION_STATE` — that substate's one legal outbound edge
+        is enforced by `validate_substate_transition` and a refused transition
+        simply isn't applied here, so nothing in this loop can walk a task
+        with an unknown submission outcome back into a submission path."""
+        try:
+            check = validate_substate_transition(self.handle.substate, substate)
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: substate check failed.", self.task_id, exc_info=True)
+            return
+        if not check.allowed:
+            logger.warning(
+                "Task %s: substate transition %s -> %s rejected (%s) — substate left unchanged.",
+                self.task_id, self.handle.substate, substate, check.reason,
+            )
+            return
+        self.handle.substate = substate
+
+    def _check_budgets(self, db, task) -> str:
+        """Evaluates the ADDITIONAL per-run budgets (`budgets.py`). Returns
+        `"CONTINUE"` (nothing blown), `"PAUSED"` (a human-intervention pause
+        was raised — the caller waits then re-loops) or `"STOP"` (the task was
+        marked failed — the caller returns).
+
+        These never loosen anything: `MAX_ITERATIONS_PER_RESUME` and
+        `MAX_FIELD_ATTEMPTS` are enforced exactly where they always were and
+        with their original values; a budget here can only stop a run EARLIER
+        than those would. A blown budget routes into the loop's existing
+        paths — `_pause_for_human` for REQUEST_HUMAN_INTERVENTION,
+        `_safe_mark_failed` for TASK_FAILED — never a new one."""
+        try:
+            exceeded = self.handle.budgets.check()
+        except Exception:  # noqa: BLE001 — counting must never crash a real run
+            logger.debug("Task %s: budget check failed.", self.task_id, exc_info=True)
+            return "CONTINUE"
+        if exceeded is None:
+            return "CONTINUE"
+        logger.warning("Task %s: %s", self.task_id, exceeded.message)
+        self._record_audit(db, task, "budget_exceeded", {
+            "budget": exceeded.budget_name, "limit": exceeded.limit,
+            "actual": exceeded.actual, "recommended_decision": exceeded.recommended_decision,
+        })
+        if exceeded.recommended_decision == "REQUEST_HUMAN_INTERVENTION":
+            self._pause_for_human(db, task, {
+                "type": "UNKNOWN_BLOCKER",
+                "reason": exceeded.message,
+                "message": "Autogram reached the safe limit it was given for this application and stopped rather "
+                           "than keep going. Please check the browser tab and let it know how to continue.",
+                "information_required": None,
+            }, safe_metadata={"detection_layer": "budget", "budget": exceeded.budget_name})
+            return "PAUSED"
+        self._safe_mark_failed(db, task, exceeded.message, reason=f"budget_{exceeded.budget_name}")
+        return "STOP"
+
+    def _record_budgeted_action(self, result, *, changed_page: bool) -> None:
+        """One `BudgetTracker.record_action` call per dispatched action —
+        best-effort, never raising."""
+        try:
+            self.handle.budgets.record_action(
+                result.action_type,
+                succeeded=bool(result.success and result.verified),
+                changed_page=changed_page,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: budget action accounting failed.", self.task_id, exc_info=True)
+
+    def _apply_recovery(self, result, *, blocked_reason_handled: bool = False):
+        """Classifies a failed action via `recovery.classify_failure` /
+        `recovery.recovery_policy` and returns the `RecoveryDecision` (or
+        `None` when there is nothing to recover from).
+
+        This NEVER overrides the module's verdict: `recovery_policy` resolves
+        OTP/CAPTCHA/LOGIN/SESSION codes to `HUMAN` and nothing here second-
+        guesses that — the caller's only options for a `HUMAN` verdict are the
+        existing pause paths. Purely a classifier here; acting on it is the
+        caller's job."""
+        if result is None or blocked_reason_handled:
+            return None
+        try:
+            code = result.failure_code or recovery.classify_failure(
+                action_succeeded=bool(result.success),
+                action_verified=bool(result.verified),
+                no_progress_streak=self.handle.budgets.no_progress_streak,
+            )
+            if code is None:
+                return None
+            attempts = int(self.handle.recovery_attempts.get(code, 0))
+            decision = recovery.recovery_policy(code, attempts_so_far=attempts)
+            self.handle.recovery_attempts[code] = attempts + 1
+            return decision
+        except Exception:  # noqa: BLE001 — recovery classification is additive, never fatal
+            logger.debug("Task %s: recovery classification failed.", self.task_id, exc_info=True)
+            return None
+
+    def _classify_page(self, page_state):
+        """`page_classifier.classify_page`, degrading to `None` on any
+        failure. Additive context only — nothing in this loop's control flow
+        branches on it; the existing `page_state.page_type`
+        (`observer.classify_page_type`) is untouched and still drives every
+        existing check."""
+        try:
+            return classify_page(page_state)
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: universal page classification failed.", self.task_id, exc_info=True)
+            return None
+
+    def _record_page_visit(self, signature, classification) -> None:
+        """Records this observation in the dynamic `PageGraph` and closes the
+        edge opened by the previous action. Observability only — never gating
+        (see `page_graph.py`'s module docstring)."""
+        if signature is None:
+            return
+        try:
+            fingerprint = self.handle.page_graph.visit(
+                signature,
+                page_type=(classification.page_type if classification else "UNKNOWN"),
+                application_stage=(classification.application_stage if classification else None),
+            )
+            self.handle.page_graph.close_pending_edge(fingerprint)
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: page-graph bookkeeping failed.", self.task_id, exc_info=True)
+
+    def _flush_agent_progress(self, db, task) -> None:
+        """Persists the in-memory page graph and sub-state into the existing
+        free-form `application_progress` JSONB column (no new column, exactly
+        as `page_graph.py`'s docstring prescribes). Called only when the loop
+        pauses for a human — the moment the extra write is actually worth
+        something, and rare enough not to add a commit to the hot path.
+        Best-effort: purely observability, never worth failing a task over."""
+        try:
+            progress = dict(getattr(task, "application_progress", None) or {})
+            progress["page_graph"] = self.handle.page_graph.as_dict()
+            progress["substate"] = self.handle.substate
+            task_repo.update_progress(db, task, progress)
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: could not flush agent progress.", self.task_id, exc_info=True)
+
+    # ---- submission-outcome safety (spec §6/§10) ------------------------
+    #
+    # The one irreversible action in the product is a final submit click.
+    # Everything below exists for the single case where one was DISPATCHED
+    # and its outcome could not be established — the page never settled, the
+    # browser died, the worker was killed, the process restarted. From that
+    # point the honest answer is "this application may or may not have been
+    # submitted", and the only safe behavior is to stop: never re-dispatch a
+    # submit, never silently resume the pre-crash plan, always re-observe and
+    # require a fresh, explicitly human-approved decision.
+    #
+    # This does not replace `executor.py`'s approval gate or
+    # `validate_action_grounding` — both still run first and unchanged. It
+    # closes the gap NEITHER of them covers: `auto_submit_approved` is a
+    # PERSISTED column, so once approved it keeps approving, and a second
+    # submit click on a still-unchanged page passes grounding too. Before
+    # this, a submit whose result came back unverified left the loop free to
+    # re-observe and click submit again on the very next iteration, with no
+    # new human decision anywhere in between.
+
+    def _is_submit_intent(self, action: AgentAction, match, element_name: str | None) -> bool:
+        """Whether dispatching this action could plausibly submit the
+        application. Deliberately over-inclusive: it trusts EITHER the
+        observer's semantic classification or `executor.py`'s own name-based
+        submit test (the same one its approval gate uses), so a control only
+        one of them recognizes still counts."""
+        if action.action_type != "click":
+            return False
+        if match is not None and getattr(match, "semantic_action", None) == "SUBMIT":
+            return True
+        return bool(element_name and is_submit_control_name(element_name))
+
+    def _submit_in_flight(self, task) -> dict | None:
+        """The durable marker for "a submit was dispatched and we never
+        established what came of it", read from the existing free-form
+        `application_progress` JSONB column (no new column, same precedent as
+        `page_graph`/`substate`)."""
+        try:
+            return (getattr(task, "application_progress", None) or {}).get("submit_in_flight")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _mark_submit_in_flight(self, db, task, element_name: str | None) -> None:
+        """Written BEFORE the click is dispatched, so a crash in the middle of
+        the click still leaves the marker behind. Best-effort on the DB, but
+        `handle.submit_outcome_unknown` is set unconditionally so the
+        same-process guarantee never depends on the write landing."""
+        self.handle.submit_outcome_unknown = True
+        try:
+            progress = dict(getattr(task, "application_progress", None) or {})
+            progress["submit_in_flight"] = {"element_name": element_name}
+            task_repo.update_progress(db, task, progress)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Task %s: could not persist the submit-in-flight marker — the in-process "
+                "guard still holds for this run.", self.task_id, exc_info=True,
+            )
+
+    def _clear_submit_in_flight(self, db, task) -> None:
+        """Called ONLY when the submit's outcome is actually known: the click
+        was refused before it ran, or it came back verified (the page moved
+        on, so the result is observable)."""
+        self.handle.submit_outcome_unknown = False
+        try:
+            progress = dict(getattr(task, "application_progress", None) or {})
+            if progress.pop("submit_in_flight", None) is not None:
+                task_repo.update_progress(db, task, progress)
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: could not clear the submit-in-flight marker.", self.task_id, exc_info=True)
+
+    def _enter_unknown_submission_state(self, db, task, reason: str, message: str) -> None:
+        """The one terminal-for-this-run landing pad for an unestablished
+        submission outcome. Pauses for a human FIRST (so the pause records
+        `HUMAN_REQUIRED` normally), then sinks the substate to
+        `UNKNOWN_SUBMISSION_STATE`, whose only legal outbound edge is a
+        brand-new task's `CREATED` — so nothing afterwards in this run can
+        walk it back into a submission substate."""
+        self._record_audit(db, task, "unknown_submission_state", {"reason": reason})
+        self._pause_for_human(db, task, {
+            "type": "USER_CONFIRMATION_REQUIRED",
+            "reason": reason,
+            "message": message,
+            "information_required": None,
+        }, safe_metadata={"detection_layer": "submission_outcome_unknown"})
+        self._set_substate("UNKNOWN_SUBMISSION_STATE")
+        self._flush_agent_progress(db, task)
+
+    def _guard_unresolved_submission(self, db, task) -> bool:
+        """Run once at the top of each `_loop_body` entry (i.e. on every fresh
+        run AND every resume). Returns True when this task carries an
+        unresolved submit from a previous, interrupted run — in which case the
+        loop must pause rather than continue whatever it was doing."""
+        marker = self._submit_in_flight(task)
+        if marker is None:
+            return False
+        control_name = (marker or {}).get("element_name") or "the submit control"
+        self._enter_unknown_submission_state(
+            db, task,
+            reason=(
+                f"A final submission click on {control_name!r} was dispatched by an earlier run "
+                "that was interrupted before its outcome could be recorded."
+            ),
+            message=(
+                "Autogram clicked submit on this application, but was interrupted before it could "
+                "confirm what happened. This application MAY OR MAY NOT have been submitted. "
+                "Please check the employer's site: if it went through, nothing more is needed; if "
+                "it did not, start a new task. Autogram will not submit again on its own."
+            ),
+        )
+        return True
+
+    def _truth_store(self, task) -> TruthStore:
+        """A `TruthStore` over exactly the sources this task already carries —
+        no new DB reads, no cross-application answer memory (that lookup stays
+        opt-in; see `TruthStore.from_task_context`)."""
+        profile = (task.candidate_profile or {})
+        return TruthStore.from_task_context(
+            candidate_profile=profile.get("profile") or {},
+            parsed_resume=profile.get("parsed_resume") or {},
+            confirmed_answers=task.confirmed_answers or {},
+        )
+
+    def _answer_decision(self, task, match, value: str | None):
+        """Routes "may this value be written into this field?" through
+        `truth_store.decide()` (spec §5's can-answer / should-autofill split).
+
+        Returns `(is_sourced, decision_or_None, classification_or_None)`.
+        `is_sourced` keeps its existing meaning and its existing consumer —
+        `executor.py`'s sensitive-field gate, which stays exactly as it is and
+        remains an INDEPENDENT second check. This is belt-and-suspenders: a
+        value is only sourced when BOTH the legacy substring check against the
+        profile/confirmed answers AND the provenance policy accept it.
+
+        A VALUELESS action (`check`/`uncheck` — "I certify...", "I agree to
+        arbitration", a work-authorization yes/no checkbox) carries no text
+        for the legacy substring check to source, so `_value_is_sourced`
+        trivially returns True for it. That would have handed `executor.py`'s
+        sensitive-field gate a free pass on exactly the acknowledgements the
+        spec says need the user, so for those the provenance policy decides
+        on its own: only a fact the user actually supplied for that label
+        makes the tick sourced."""
+        legacy_sourced = self._value_is_sourced(task, value)
+        if match is None:
+            return legacy_sourced, None, None
+        try:
+            classification = classify_field(match)
+            fact = self._truth_store(task).resolve_any([
+                label for label in (match.name, getattr(match, "section", None)) if label
+            ])
+            decision = decide_answer(
+                fact=fact,
+                coarse_category=classification.coarse_category,
+                sensitive=classification.sensitive,
+            )
+        except Exception:  # noqa: BLE001 — never let the policy layer break a fill
+            logger.debug("Task %s: truth-store policy check failed.", self.task_id, exc_info=True)
+            return legacy_sourced, None, None
+        if not value:
+            # See the docstring: the legacy check is vacuous here, and the
+            # extra ledger context stays `None` so nothing else about a
+            # valueless action's bookkeeping changes.
+            return bool(decision.autofill_permitted), None, None
+        return bool(legacy_sourced and decision.autofill_permitted), decision, classification
+
+    def _record_question_ledger(self, db, task, match, action: AgentAction, result, answer_decision, classification) -> None:
+        """Writes/updates this field's `question_ledger` entry ALONGSIDE the
+        existing `field_attempt_ledger` bookkeeping (which is untouched).
+        Best-effort: a ledger write failing must never abort an application."""
+        if match is None or action.action_type not in ("click", "fill", "select", "check", "uncheck"):
+            return
+        try:
+            identity = field_identity(match)
+            fact = answer_decision.fact if answer_decision is not None else None
+            requires_human = bool(answer_decision.requires_human) if answer_decision is not None else False
+            if result.blocked_reason == "sensitive_field_requires_human":
+                status, requires_human = "PENDING_HUMAN", True
+            elif result.success and result.verified:
+                status = "RESOLVED_CONFIRMED" if (fact and fact.source == "USER_CONFIRMED") else "RESOLVED_AUTO"
+            elif requires_human:
+                status = "PENDING_HUMAN"
+            else:
+                status = "FAILED"
+            previous = self.handle.question_ledger.get(identity)
+            entry = QuestionLedgerEntry(
+                question_id=identity,
+                page_id=task.task_id,
+                element_ref=action.element_ref,
+                raw_label=match.name or getattr(match, "section", "") or "",
+                normalized_category=(classification.coarse_category if classification else None),
+                field_type=getattr(match, "type", "") or "",
+                answer=action.value,
+                answer_source=(fact.source.lower() if fact else None),
+                answer_provenance=(fact.source if fact else "UNKNOWN"),
+                confidence=1.0 if (fact and fact.verified) else 0.0,
+                sensitivity=bool(classification.sensitive) if classification else False,
+                status=status,
+                attempt_count=(previous.attempt_count + 1) if previous is not None else 1,
+                requires_human=requires_human,
+            )
+            self.handle.question_ledger.record(identity, entry)
+            task_repo.record_question_ledger_entry(db, task, identity, entry.as_dict())
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: could not record a question-ledger entry.", self.task_id, exc_info=True)
+
+    def _question_ledger_summary(self) -> list[dict]:
+        """The short "still waiting on a human" list handed to
+        `decide_next_step` so the model stops re-proposing an answer for a
+        question already escalated. Capped, and never carries a value."""
+        try:
+            return [
+                {"label": e.raw_label, "category": e.normalized_category, "why": e.explain()}
+                for e in self.handle.question_ledger.pending_human_entries()[:10]
+            ]
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _resolved_facts_summary(self, task) -> dict:
+        """Which logical facts are resolvable and from WHERE — labels and
+        provenance only, never values (those already reach the prompt through
+        the profile/resume/confirmed-answer keys)."""
+        try:
+            store = self._truth_store(task)
+            out: dict = {}
+            for label in (
+                "full name", "first name", "last name", "email", "phone", "location",
+                "linkedin", "github", "portfolio", "current company", "current role",
+                "years of experience", "expected salary", "notice period",
+            ):
+                fact = store.resolve(label)
+                if fact is not None:
+                    out[label] = fact.source
+            return out
+        except Exception:  # noqa: BLE001
+            return {}
+
     # ------------------------------------------------------------------
 
     def _loop_body(self, db, task) -> None:
         iterations = 0
+        if not self.handle.question_ledger_loaded:
+            # Rehydrate the per-question ledger from the DB once per run, the
+            # same way a resumed task picks `field_attempt_ledger` back up.
+            self.handle.question_ledger = QuestionLedger.from_dict(getattr(task, "question_ledger", None) or {})
+            self.handle.question_ledger_loaded = True
+        # Spec §6/§10: a run that is starting or resuming while a previous
+        # run's submit click is still unaccounted for must never pick that
+        # plan back up. Checked BEFORE the loop so it cannot be reached by
+        # observing/deciding first.
+        # The run ENDS here rather than waiting for a resume: there is no plan
+        # left that could be safely resumed, only a new, human-started task.
+        # The browser is left open deliberately (same as the
+        # MAX_ITERATIONS_PER_RESUME ceiling) so a person can look at where it
+        # got to.
+        if self._guard_unresolved_submission(db, task):
+            return
         while True:
             # A cancel can arrive on the local handle (same process) or, when
             # this loop runs in a worker, via the Redis control channel from
@@ -304,10 +780,20 @@ class AutonomousAgentLoop:
                 publish_task_event(task.task_id, "APPLICATION_FAILED", reason="max_iterations_exceeded")
                 return  # browser left open deliberately: a human may want to look at where it got stuck
 
+            # The ADDITIONAL, configurable budgets (`budgets.py`) — checked
+            # AFTER the two hardcoded ceilings above, which they never relax.
+            budget_outcome = self._check_budgets(db, task)
+            if budget_outcome == "STOP":
+                return  # browser left open deliberately, same as the ceiling above
+            if budget_outcome == "PAUSED":
+                self._wait_for_resume()
+                continue
+
             db.refresh(task)  # pick up anything an /answer or /approve call wrote concurrently
             if task.current_status in ("RESUMING", "WAITING_FOR_HUMAN", "WAITING_FOR_APPROVAL"):
                 self._record_audit(db, task, "automation_resuming", {"from_status": task.current_status})
-                task_repo.set_status(db, task, "RUNNING")
+                self._set_substate("RESUMING")
+                self._set_status(db, task, "RUNNING")
 
             # A human just submitted an OTP/MFA code via POST /human-requests/{id}/respond
             # (`app/api/human_interaction.py`, `runner.py::deliver_secret`). Handle it
@@ -320,9 +806,27 @@ class AutonomousAgentLoop:
                     self._wait_for_resume()
                 continue
 
+            self._set_substate("OBSERVING")
             page_state = observe_page(self.handle.page, ats_hint=self._ats_hint())
             current_signature = self._safe_page_signature()
             page_state.page_signature = repr(current_signature) if current_signature is not None else ""
+            # The UNIVERSAL, portal-agnostic page classification (§1). This
+            # SUPPLEMENTS `observer.classify_page_type` (still computed inside
+            # `observe_page` and still the value of `page_state.page_type`,
+            # which every existing branch below keeps reading) — it never
+            # replaces it.
+            page_classification = self._classify_page(page_state)
+            # Validation-run observability (never contains field values, resume
+            # text, or profile data — url/page-type/element-count only): lets a
+            # human tailing console output follow PageState -> decision ->
+            # action -> result without querying the DB audit trail.
+            logger.info(
+                "Task %s: observed page_type=%s classification=%s url=%s elements=%d",
+                self.task_id, page_state.page_type,
+                page_classification.page_type if page_classification else None,
+                page_state.url, len(page_state.elements),
+            )
+            self._record_page_visit(current_signature, page_classification)
             # Mirrors the task's own (authoritative) status rather than
             # running a second, driftable classifier for something the DB
             # already tracks correctly — see `observer.py::classify_page_type`
@@ -390,6 +894,8 @@ class AutonomousAgentLoop:
             if current_signature is not None:
                 self.handle.last_page_signature = current_signature
 
+            self._set_substate("DECIDING")
+            self.handle.budgets.record_llm_call()
             try:
                 decision = decide_next_step(
                     job_url=task.job_url,
@@ -402,6 +908,9 @@ class AutonomousAgentLoop:
                     action_history=task.action_history or [],
                     uploaded_documents=task.uploaded_documents or [],
                     auto_submit_approved=bool(task.auto_submit_approved),
+                    page_classification=(page_classification.as_dict() if page_classification else None),
+                    question_ledger_summary=self._question_ledger_summary(),
+                    resolved_facts_summary=self._resolved_facts_summary(task),
                 )
             except DecisionError as e:
                 logger.warning("Task %s: decision step failed (%s) — requesting human intervention.", self.task_id, e)
@@ -414,6 +923,15 @@ class AutonomousAgentLoop:
                 })
                 self._wait_for_resume()
                 continue
+
+            # Validation-run observability: the decision itself, never its
+            # justification text (`decision.reasoning`/`evidence` may echo page
+            # content back, which is untrusted — keep it out of process logs).
+            logger.info(
+                "Task %s: decision=%s%s", self.task_id, decision.decision_type,
+                f" action={decision.action.action_type} element_ref={decision.action.element_ref}"
+                if decision.decision_type == "EXECUTE_ACTION" and decision.action else "",
+            )
 
             if decision.decision_type == "EXECUTE_ACTION":
                 if not self._handle_execute_action(db, task, page_state, decision):
@@ -517,10 +1035,17 @@ class AutonomousAgentLoop:
                 and not self._ensure_field_coverage(db, task, page_state)):
             return False
 
+        # Multi-step validation before dispatch: the existing grounding gate,
+        # plus the stale-element-reference check — the ref was assigned on the
+        # page whose signature `page_state` was observed from, so if the live
+        # page has moved on since, that ref may now address a different
+        # control entirely.
         grounding = validate_action_grounding(
             action,
             page_state,
             canonical_urls=(task.job_url, page_state.url),
+            expected_signature=self.handle.last_page_signature,
+            current_signature=self._safe_page_signature(),
         )
         if not grounding.grounded:
             result = ActionResult(
@@ -528,8 +1053,27 @@ class AutonomousAgentLoop:
                 f"Rejected ungrounded action: {grounding.reason}",
                 blocked_reason="action_not_grounded", verified=False,
                 result_code="ACTION_REJECTED", postcondition="action was not dispatched",
+                failure_code="STALE_REFERENCE" if grounding.stale_reference else None,
             )
             self.handle.last_action_verified = False
+            if grounding.stale_reference:
+                # `recovery_policy("STALE_REFERENCE")` says REOBSERVE, not
+                # RETRY: the fix for a ref that belongs to a page that has
+                # moved on is a fresh observation, which is exactly what
+                # returning True does (the loop `continue`s straight into the
+                # next `observe_page`). No pause, no vision call, no human.
+                policy = recovery.recovery_policy("STALE_REFERENCE")
+                task_repo.append_action(db, task, {
+                    "action_type": action.action_type, "element_ref": action.element_ref,
+                    "element_name": element_name, "value": None, "url": action.url,
+                    "reasoning": decision.reasoning, **result.as_dict(),
+                })
+                self._record_audit(db, task, "action_rejected", {
+                    "reason": "stale_element_reference",
+                    "recovery_action": policy.action if policy else None,
+                })
+                self._record_budgeted_action(result, changed_page=True)
+                return True
             task_repo.append_action(db, task, {
                 "action_type": action.action_type, "element_ref": action.element_ref,
                 "element_name": element_name, "value": None, "url": action.url,
@@ -599,7 +1143,42 @@ class AutonomousAgentLoop:
                 "information_required": None,
             }, detection_layer="field_ledger")
 
-        is_sourced = self._value_is_sourced(task, action.value)
+        # Spec §5: the "can answer" vs "may auto-fill" split is decided here,
+        # by `truth_store.decide()`, on top of the original substring check.
+        # `executor.py`'s sensitive-field gate is deliberately left exactly as
+        # it is and still runs on the result — two independent checks, both of
+        # which must pass for a sensitive value to be written.
+        # Spec §6/§10. A submit whose outcome was never established must never
+        # be followed by another submit attempt — `auto_submit_approved` is a
+        # persisted column that keeps approving, and a page that never changed
+        # still passes grounding, so neither existing gate stops this on its
+        # own. Checked AFTER grounding/field-ledger (so an ungrounded or
+        # already-exhausted action is still rejected for its own, more
+        # specific reason) and BEFORE anything is dispatched.
+        submit_intent = self._is_submit_intent(action, match, element_name)
+        if submit_intent and (self.handle.submit_outcome_unknown or self._submit_in_flight(task)):
+            self._record_audit(db, task, "action_rejected", {
+                "reason": "submit_outcome_unknown", "element_name": element_name,
+            })
+            self._enter_unknown_submission_state(
+                db, task,
+                reason=(
+                    f"A second submission click on {element_name!r} was refused: an earlier submit "
+                    "was dispatched and its outcome was never established."
+                ),
+                message=(
+                    "Autogram already clicked submit on this application and could not confirm what "
+                    "happened, so it refused to click submit a second time — applying twice to the "
+                    "same job is not something it will risk. Please check the employer's site to see "
+                    "whether the first attempt went through."
+                ),
+            )
+            return False
+
+        is_sourced, answer_decision, field_classification = self._answer_decision(task, match, action.value)
+        self._set_substate("EXECUTING")
+        if submit_intent:
+            self._mark_submit_in_flight(db, task, element_name)
         executor = ActionExecutor(
             self.handle.page,
             auto_submit_approved=bool(task.auto_submit_approved),
@@ -609,11 +1188,61 @@ class AutonomousAgentLoop:
             action, element_name=element_name, element_type=_widget_type(match),
             element_semantic_action=(match.semantic_action if match else None), is_sourced=is_sourced,
         )
+        # Validation-run observability (never the fill value itself):
+        logger.info(
+            "Task %s: action=%s element_ref=%s success=%s verified=%s blocked_reason=%s result_code=%s",
+            self.task_id, action.action_type, action.element_ref,
+            result.success, result.verified, result.blocked_reason, result.result_code,
+        )
         # Feeds the page-signature stall check at the top of `_loop_body`:
         # set unconditionally (including a blocked action) so "the model kept
         # proposing something that didn't work" reads as stalled too, not
         # just an executed-but-ineffective one.
         self.handle.last_action_verified = bool(result.success and result.verified)
+        if submit_intent:
+            # Three outcomes, only two of which are knowable:
+            #   * refused before it ran (a safety gate) — nothing was clicked,
+            #     so there is nothing unresolved;
+            #   * dispatched AND verified — the page observably moved on, so
+            #     the normal confirmation/completion path owns it from here;
+            #   * anything else — dispatched with an unestablished outcome.
+            #     The marker STAYS, and this run stops.
+            if result.blocked_reason is not None or (result.success and result.verified):
+                self._clear_submit_in_flight(db, task)
+            else:
+                task_repo.append_action(db, task, {
+                    "action_type": action.action_type, "element_ref": action.element_ref,
+                    "element_name": element_name, "value": None, "url": action.url,
+                    "reasoning": decision.reasoning, **result.as_dict(),
+                })
+                self._enter_unknown_submission_state(
+                    db, task,
+                    reason=(
+                        f"A submission click on {element_name!r} was dispatched but its outcome "
+                        f"could not be confirmed ({result.detail})."
+                    ),
+                    message=(
+                        "Autogram clicked submit on this application but could not confirm whether it "
+                        "went through. This application MAY OR MAY NOT have been submitted. Please "
+                        "check the employer's site before starting a new task — Autogram will not "
+                        "click submit again on its own."
+                    ),
+                )
+                return False
+        # Additive accounting, all best-effort and none of it gating: the
+        # per-run budgets, the dynamic page graph's outbound edge, and this
+        # field's question-ledger entry (alongside — never instead of — the
+        # `field_attempt_ledger` bookkeeping further down).
+        self._record_budgeted_action(result, changed_page=bool(result.success and result.verified))
+        try:
+            self.handle.page_graph.record_action(
+                action.action_type, element_name or (action.url or ""),
+                succeeded=bool(result.success and result.verified),
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: page-graph edge bookkeeping failed.", self.task_id, exc_info=True)
+        self._record_question_ledger(db, task, match, action, result, answer_decision, field_classification)
+        self._set_substate("VERIFYING")
 
         # A verification-code-shaped field is never logged with its real
         # attempted value — `executor.py`'s gate already refused to actually
@@ -713,16 +1342,22 @@ class AutonomousAgentLoop:
             self._track_verification_streak(action, result)
             self._record_field_attempt(db, task, match, action, result)
             recovery_action = AgentAction(action_type="go_back")
-            recovery = executor.execute(recovery_action)
+            # NOT named `recovery`: that is the module imported at the top of
+            # this file, and binding it as a local ANYWHERE in this function
+            # makes it a local for the WHOLE function — which turned the
+            # `recovery.recovery_policy("STALE_REFERENCE")` call in the
+            # stale-reference branch far above into an UnboundLocalError on
+            # every single stale ref.
+            recovery_result = executor.execute(recovery_action)
             task_repo.append_action(db, task, {
                 "action_type": "go_back", "element_ref": None,
                 "element_name": None, "value": None, "url": None,
                 "reasoning": "Recover from a verified error destination.",
-                **recovery.as_dict(),
+                **recovery_result.as_dict(),
             })
-            self._record_chat_action(db, task, recovery_action, None, recovery)
-            self.handle.last_action_verified = bool(recovery.success and recovery.verified)
-            if recovery.success and recovery.verified:
+            self._record_chat_action(db, task, recovery_action, None, recovery_result)
+            self.handle.last_action_verified = bool(recovery_result.success and recovery_result.verified)
+            if recovery_result.success and recovery_result.verified:
                 self._record_audit(db, task, "navigation_recovered", {
                     "failed_result": result.result_code,
                 })
@@ -737,6 +1372,47 @@ class AutonomousAgentLoop:
 
         self._track_verification_streak(action, result)
         self._record_field_attempt(db, task, match, action, result)
+
+        # Spec §11: name WHY this didn't work before deciding what to do about
+        # it. `recovery_policy`'s verdict is followed, never overridden — in
+        # particular OTP/MFA/CAPTCHA/LOGIN/SESSION codes always resolve to
+        # "HUMAN" there and are routed straight to the existing pause path,
+        # with no retry and no bypass. Every other verdict (RETRY/REOBSERVE/
+        # ESCALATE) falls through to the loop machinery that already handles
+        # it: the next iteration re-observes, and the persisted field ledger +
+        # verification streak below still own the escalation ceilings.
+        recovery_decision = self._apply_recovery(
+            result, blocked_reason_handled=result.blocked_reason is not None,
+        )
+        if recovery_decision is not None:
+            self._record_audit(db, task, "recovery_classified", {
+                "failure_code": result.failure_code,
+                "recovery_action": recovery_decision.action,
+                "reason": recovery_decision.reason,
+            })
+            if recovery_decision.action == "HUMAN":
+                # Spec §9: the record a human reads must name the SPECIFIC
+                # thing that stopped automation, not just the failure
+                # category. `element_name` is the field/control this recovery
+                # verdict is actually about and is right here in scope — a
+                # pause that only carried the generic per-type prose left the
+                # person with "Sign-in required." and no way to tell which
+                # step of which form it happened on. The generic sentence is
+                # kept (it is the action-required half) and the specific
+                # context is prepended, never substituted.
+                recovery_type = recovery_decision.request_type or "UNKNOWN_BLOCKER"
+                generic = self._message_for_request_type(recovery_type, None)
+                where = f" while working on {element_name!r}" if element_name else ""
+                self._pause_for_human(db, task, {
+                    "type": recovery_type,
+                    "reason": f"{recovery_decision.reason}{where}.",
+                    "message": (
+                        f"Autogram stopped{where} because {recovery_decision.reason}. {generic}"
+                    ),
+                    "information_required": element_name,
+                }, safe_metadata={"detection_layer": "recovery_engine"})
+                return False
+
         if self.handle.unverified_streak >= 3:
             streak_ref = self.handle.last_unverified_ref
             self.handle.unverified_streak = 0
@@ -810,6 +1486,64 @@ class AutonomousAgentLoop:
             return f"{base} A code may have been sent to {masked_destination}."
         return base
 
+    def _current_page_type(self) -> str | None:
+        """The page classification (`page_classifier.classify_page`) recorded
+        for the page the loop is standing on right now, read back off the
+        dynamic page graph rather than re-plumbed through every pause call
+        site. `None` when nothing has been observed yet."""
+        try:
+            graph = self.handle.page_graph.as_dict()
+            node = (graph.get("nodes") or {}).get(graph.get("current"))
+            return node.get("page_type") if node else None
+        except Exception:  # noqa: BLE001 — observability only
+            return None
+
+    def _ledger_explanation(self, label: str | None) -> str | None:
+        """The question ledger's own one-sentence "why did Autogram enter this
+        answer?" (`QuestionLedgerEntry.explain`) for the field a pause is
+        about, matched by its raw label. `None` when this pause isn't about a
+        field the ledger has ever seen."""
+        if not label:
+            return None
+        try:
+            for entry in self.handle.question_ledger.all_entries():
+                if entry.raw_label and entry.raw_label == label:
+                    return entry.explain()
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _pause_context(self, request_type: str, intervention: dict, safe_metadata: dict | None) -> dict:
+        """The non-secret context stored on the durable
+        `HumanInteractionRequest` alongside its prose `message` (spec §9).
+
+        A pause must be answerable from its own record — WHY automation
+        stopped, WHICH page it stopped on, WHICH question/field it is about,
+        and WHAT the person has to do — rather than a bare request-type code.
+        The `message` itself is deliberately left exactly as the caller
+        composed it (the LLM's own `intervention["message"]`, or the per-type
+        prose in `_REQUEST_TYPE_MESSAGES`); this only makes the same facts
+        available structurally as well, and never carries a value (see
+        `human_interaction_repository`'s HARD RULE)."""
+        label = intervention.get("information_required")
+        context = {
+            **(safe_metadata or {}),
+            "information_required": label,
+            # WHY: the specific cause, not just the category code.
+            "reason": intervention.get("reason"),
+            # WHERE: the page classification the agent stopped on.
+            "page_type": self._current_page_type(),
+            # WHAT TO DO: always present, even when an LLM-authored `message`
+            # explained the situation without ever saying what is needed.
+            "action_required": self._message_for_request_type(
+                request_type, (safe_metadata or {}).get("masked_destination"),
+            ),
+        }
+        explanation = self._ledger_explanation(label)
+        if explanation:
+            context["field_explanation"] = explanation
+        return context
+
     def _attempt_vision_assisted_decision(self, task, page_state: PageState) -> tuple[Decision | None, bytes | None]:
         """Spec §19: before finalizing a human-intervention pause for a
         genuinely ambiguous reason, try once more with a screenshot of the
@@ -827,6 +1561,8 @@ class AutonomousAgentLoop:
         except Exception as e:  # noqa: BLE001 - a failed capture must never block the pause it was trying to avoid
             logger.debug("Task %s: vision-assisted screenshot capture failed (%s).", self.task_id, e)
             return None, None
+        self.handle.budgets.record_llm_call()
+        self.handle.budgets.record_vision_call()
         try:
             decision = decide_next_step(
                 job_url=task.job_url,
@@ -840,6 +1576,9 @@ class AutonomousAgentLoop:
                 uploaded_documents=task.uploaded_documents or [],
                 auto_submit_approved=bool(task.auto_submit_approved),
                 screenshot=screenshot,
+                page_classification=(lambda c: c.as_dict() if c else None)(self._classify_page(page_state)),
+                question_ledger_summary=self._question_ledger_summary(),
+                resolved_facts_summary=self._resolved_facts_summary(task),
             )
         except DecisionError as e:
             logger.info("Task %s: vision-assisted decision failed (%s) — falling back to the normal pause.", self.task_id, e)
@@ -959,7 +1698,7 @@ class AutonomousAgentLoop:
             # `/human-requests/{id}/respond` route can answer a
             # USER_PROVIDED_VALUE / ANSWER_REQUIRED request without needing
             # the task's denormalized snapshot column at all.
-            safe_metadata={**(safe_metadata or {}), "information_required": intervention.get("information_required")},
+            safe_metadata=self._pause_context(request_type, intervention, safe_metadata),
             # See `_SHORT_LIVED_REQUEST_TYPES`: only a verification code has a
             # deadline worth enforcing; everything else waits as long as the
             # human needs.
@@ -972,6 +1711,13 @@ class AutonomousAgentLoop:
             "request_id": req.request_id, "request_type": request_type,
         })
         self._record_audit(db, task, "automation_paused", {"request_id": req.request_id, "request_type": request_type})
+        # Validation-run observability: the single line a human watching the
+        # console needs to see a handoff happen, without the full `message`
+        # prose (already durably recorded on the request/chat message above).
+        logger.info(
+            "Task %s: PAUSED for human — request_type=%s request_id=%s",
+            self.task_id, request_type, req.request_id,
+        )
         # The user-facing half of the same pause. `message` is the prose the
         # agent already composed for this blocker, so the chat says exactly what
         # the request says — no second wording to drift out of sync.
@@ -1006,6 +1752,8 @@ class AutonomousAgentLoop:
             "expires_at": req.expires_at.isoformat() if req.expires_at else None,
             "safe_metadata": req.safe_metadata,
         })
+        self._set_substate("HUMAN_REQUIRED")
+        self._flush_agent_progress(db, task)
         self.handle.resume_event.clear()
 
     def _try_consume_pending_secret(self, db, task) -> bool | None:
@@ -1159,6 +1907,17 @@ class AutonomousAgentLoop:
             # promptly instead of only at the next signal.
             if self.handle.resume_event.wait(timeout=2.0):
                 return True
+
+
+def _safe_close(manager, task_id: str) -> None:
+    """`BrowserManager.close()` that never raises — deliberately NOT a bare
+    `except: pass`: a close that failed is a leaked driver process and is
+    logged with its traceback, it just isn't allowed to become the error the
+    caller sees."""
+    try:
+        manager.close()
+    except Exception:  # noqa: BLE001
+        logger.exception("Task %s: browser context close failed — a driver process may have leaked.", task_id)
 
 
 def _widget_type(element) -> str | None:

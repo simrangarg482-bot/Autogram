@@ -55,7 +55,13 @@ class AgentAction:
     @staticmethod
     def from_dict(payload: dict) -> "AgentAction":
         action_type = payload.get("action_type")
-        if action_type not in ALLOWED_ACTION_TYPES:
+        # `isinstance` first: a JSON payload can carry an unhashable value
+        # (a list/dict) for this key, and a bare `in` test against the
+        # frozenset would raise `TypeError` — which `decision.py` does not
+        # catch, so a malformed model response would escape as an unhandled
+        # exception instead of the `DecisionError` the loop knows how to
+        # turn into a human handoff.
+        if not isinstance(action_type, str) or action_type not in ALLOWED_ACTION_TYPES:
             raise InvalidActionError(
                 f"Unknown or disallowed action_type {action_type!r}. "
                 f"Allowed: {sorted(ALLOWED_ACTION_TYPES)}"
@@ -109,6 +115,14 @@ class ActionResult:
     #: these fields make attempted/result/postcondition three distinct facts.
     result_code: str | None = None
     postcondition: str | None = None
+    #: One member of `recovery.FAILURE_CODES`, or `None`. Populated
+    #: best-effort by `executor.py` when it has enough context to classify
+    #: WHY an action didn't work (see `recovery.classify_failure`); `None`
+    #: means "not classified", never "succeeded" — `success`/`verified`
+    #: remain the authoritative outcome fields. Carried here so `loop.py` can
+    #: run `recovery.recovery_policy` on a real code instead of re-deriving
+    #: one from prose in `detail`.
+    failure_code: str | None = None
 
     def as_dict(self) -> dict:
         attempted = self.blocked_reason is None
@@ -123,6 +137,7 @@ class ActionResult:
             "action_result": self.result_code or ("ACTION_SUCCEEDED" if self.success else "ACTION_FAILED"),
             "postcondition_verified": bool(self.success and self.verified),
             "postcondition": self.postcondition or self.detail,
+            "failure_code": self.failure_code,
         }
 
 
@@ -131,6 +146,11 @@ class GroundingResult:
     grounded: bool
     reason: str | None = None
     preferred_element_ref: int | None = None
+    #: True only for the stale-element-reference refusal below — lets a caller
+    #: tell "this ref belongs to a page that no longer exists" (re-observe and
+    #: decide again) apart from every other grounding refusal (which needs a
+    #: different response, usually a human). Never set for any other reason.
+    stale_reference: bool = False
 
 
 def _normalize_url(url: str, base_url: str = "") -> str:
@@ -152,6 +172,8 @@ def validate_action_grounding(
     *,
     canonical_urls: tuple[str, ...] = (),
     allowlisted_urls: tuple[str, ...] = (),
+    expected_signature=None,
+    current_signature=None,
 ) -> GroundingResult:
     """Code-level grounding gate for model-proposed browser actions.
 
@@ -160,6 +182,18 @@ def validate_action_grounding(
     a high-confidence Apply/Start control is on-screen it wins over navigation,
     including navigation to an observed link: the DOM control is the action the
     page exposed and is therefore the state-aware path.
+
+    `expected_signature`/`current_signature` are both
+    `automation.applications.page_navigator.PageSignature` (or `None`) and add
+    the STALE ELEMENT REFERENCE check: an `element_ref` only means anything
+    relative to the page it was observed on, so dispatching a targeted action
+    whose observation-time signature no longer matches the live page is
+    refused — the ref may now point at a different control entirely. Both are
+    optional and default to `None`, which disables the check, so a caller that
+    has no prior signature (the very first observation of a run, or any
+    existing call site) behaves exactly as before. The check deliberately
+    applies ONLY to `TARGETED_ACTIONS`: `navigate`/`go_back`/`scroll`/`wait`
+    are expected to change the page and carry no element reference to go stale.
     """
     elements = list(getattr(page_state, "elements", ()) or ())
     preferred = next((
@@ -178,6 +212,16 @@ def validate_action_grounding(
         )
 
     if action.action_type in TARGETED_ACTIONS:
+        if (
+            expected_signature is not None
+            and current_signature is not None
+            and current_signature.differs_from(expected_signature)
+        ):
+            return GroundingResult(
+                False,
+                "stale element reference: page changed since this ref was observed",
+                stale_reference=True,
+            )
         match = next((element for element in elements if element.ref == action.element_ref), None)
         if match is None:
             return GroundingResult(False, f"element ref {action.element_ref} was not observed")

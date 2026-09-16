@@ -833,6 +833,18 @@ class AutonomousTask(Base):
     #: `"failed"` entry stops `loop.py::_handle_execute_action` from ever
     #: dispatching another action at that field again for this task.
     field_attempt_ledger = Column(JSONB, nullable=False, default=dict)
+    #: Per-question ledger for the autonomous path (see
+    #: `automation/agents/autonomous/question_ledger.py`) — the autonomous
+    #: counterpart of the deterministic engine's `ApplicationQuestion` table,
+    #: kept as JSONB on the task for the same reason `field_attempt_ledger`
+    #: is: it is per-task agent state, not a separately addressable resource
+    #: with its own review UI. Keyed by `observer.field_identity`, one
+    #: `QuestionLedgerEntry.as_dict()` per value, so "why did Autogram enter
+    #: this answer?" is answerable per field (raw label, coarse category,
+    #: provenance, confidence, sensitivity, status) without replaying
+    #: `action_history`. Written via
+    #: `autonomous_task_repository.record_question_ledger_entry`.
+    question_ledger = Column(JSONB, nullable=False, default=dict)
     uploaded_documents = Column(JSONB, nullable=False, default=list)
     final_result = Column(JSONB, nullable=True)
     error = Column(Text, nullable=True)

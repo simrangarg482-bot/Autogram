@@ -196,6 +196,18 @@ _EXTRACT_ELEMENTS_JS = r"""
   const validation_messages = Array.from(document.querySelectorAll(
     '[role="alert"], [aria-live="assertive"], .error, .errors, .field-error, .validation-error, [data-error]'
   )).filter(isVisible).map(textOf).filter(Boolean).map(t => t.slice(0, 300)).slice(0, 30);
+  // Content-sized iframes only (>= 100x100), so a 1x1 tracking pixel or a
+  // tiny analytics frame never counts. `document.querySelectorAll` above
+  // does NOT descend into an iframe's document, so a form rendered inside
+  // one is completely invisible to this extraction — this count is how the
+  // caller can tell "this page genuinely has no fields" apart from "this
+  // page's fields are somewhere this observer cannot see."
+  const content_frame_count = Array.from(document.querySelectorAll('iframe'))
+    .filter(isVisible)
+    .filter(f => {
+      const r = f.getBoundingClientRect();
+      return r.width >= 100 && r.height >= 100;
+    }).length;
   const forms = Array.from(document.forms).filter(isVisible).map(form => ({
     id: form.id || '', name: form.getAttribute('name') || '', action: form.action || '',
     method: (form.method || 'get').toLowerCase(),
@@ -205,7 +217,7 @@ _EXTRACT_ELEMENTS_JS = r"""
       || ['combobox', 'checkbox', 'radio', 'textbox'].includes(e.role)
       || e.type === 'textbox';
   let extras = 0;
-  return {elements: out.filter(e => isField(e) || extras++ < __MAX_ELEMENTS__), headings, dialogs, validation_messages, forms};
+  return {elements: out.filter(e => isField(e) || extras++ < __MAX_ELEMENTS__), headings, dialogs, validation_messages, forms, content_frame_count};
 }
 """
 
@@ -295,6 +307,15 @@ class PageState:
     required_fields: list[int] = field(default_factory=list)
     blocking_messages: list[str] = field(default_factory=list)
     page_signature: str = ""
+    #: How many content-sized (>= 100x100) `<iframe>` elements are visible on
+    #: this page. The fixed extraction script runs against the MAIN frame's
+    #: `document` only and never descends into an iframe, so an application
+    #: form rendered inside one produces ZERO elements here. This count is the
+    #: honest signal that "no fields observed" may mean "fields not
+    #: observable", not "page has no fields" — see `compute_page_completion`,
+    #: which refuses to call such a page complete, and
+    #: `page_classifier.classify_page`, which records it as a signal.
+    content_frame_count: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -312,6 +333,7 @@ class PageState:
             "required_fields": self.required_fields,
             "blocking_messages": self.blocking_messages,
             "page_signature": self.page_signature,
+            "content_frame_count": self.content_frame_count,
         }
 
 
@@ -343,6 +365,26 @@ def compute_page_completion(page_state: PageState) -> PageCompletion:
     checkbox/radio counts as missing when unchecked. Disabled controls are
     never "missing" — a field the page itself has turned off isn't something
     the candidate can fill."""
+    # An application form rendered inside an `<iframe>` is invisible to the
+    # fixed extraction script (main-frame `document` only — see
+    # `PageState.content_frame_count`). Such a page observes as ZERO elements,
+    # which would otherwise sail through every check below and report
+    # `ready=True` — i.e. "this application is complete, offer it for final
+    # submission" for a form nothing ever filled in. Refuse to call a page
+    # with no observable controls but a content-sized embedded frame complete;
+    # the loop's completion gate then escalates to a human instead.
+    if page_state.content_frame_count and not page_state.elements:
+        message = (
+            "This page's content appears to be inside an embedded frame that Autogram cannot "
+            "read, so it found no fields to check — it cannot confirm the application is complete."
+        )
+        return PageCompletion(
+            ready=False,
+            missing_required_refs=[],
+            validation_messages=list(page_state.validation_messages),
+            blocking_messages=[*page_state.dialogs, message],
+        )
+
     missing_refs: list[int] = []
     for element in page_state.elements:
         if not element.required or element.disabled:
@@ -467,12 +509,17 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
 
     try:
         url = page.url
-    except PlaywrightError:
-        pass
+    except PlaywrightError as e:
+        # Logged, not silently swallowed: an empty `url` is not cosmetic —
+        # it flows into `validate_action_grounding`'s `canonical_urls` and
+        # into the page signature, so a navigation check that later behaves
+        # oddly needs this to be traceable. Every neighbouring read here
+        # already logs; these two did not.
+        logger.debug("observe_page: could not read the page URL: %s", e)
     try:
         title = page.title()
-    except PlaywrightError:
-        pass
+    except PlaywrightError as e:
+        logger.debug("observe_page: could not read the page title: %s", e)
     try:
         body_text = page.inner_text("body")
         visible_text = " ".join(body_text.split())[:MAX_TEXT_CHARS]
@@ -530,6 +577,7 @@ def observe_page(page: Page, *, ats_hint: str | None = None) -> PageState:
         dialogs=extraction.get("dialogs") or [],
         validation_messages=extraction.get("validation_messages") or [],
         forms=extraction.get("forms") or [],
+        content_frame_count=int(extraction.get("content_frame_count") or 0),
     )
     page_state.page_type = classify_page_type(page_state)
     return page_state

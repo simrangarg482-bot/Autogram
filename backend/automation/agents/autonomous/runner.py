@@ -56,6 +56,27 @@ def _get_or_create_handle(task_id: str) -> TaskHandle:
         return handle
 
 
+def _claim_handle(task_id: str) -> TaskHandle | None:
+    """Atomically "claim this task for this thread": returns a fresh handle if
+    nobody in this process was already driving `task_id`, or `None` if
+    somebody is.
+
+    Check-and-claim has to happen under ONE lock acquisition. `is_running()`
+    followed by `_get_or_create_handle()` took the lock twice, so two
+    dispatches for the same task arriving together could both observe "not
+    running" and both go on to drive the SAME `TaskHandle` — two loops
+    sharing one browser and one resume/cancel event. Without `REDIS_URL` the
+    lease in `app/workers/runtime.py` is a no-op (`lease.acquire` returns
+    True unconditionally in a single process), so this is the only thing
+    standing between a double dispatch and a double run."""
+    with _REGISTRY_LOCK:
+        if task_id in _REGISTRY:
+            return None
+        handle = TaskHandle(resume_event=threading.Event(), cancel_requested=threading.Event())
+        _REGISTRY[task_id] = handle
+        return handle
+
+
 def is_running(task_id: str) -> bool:
     with _REGISTRY_LOCK:
         return task_id in _REGISTRY
@@ -78,10 +99,10 @@ def execute_task_sync(task_id: str) -> None:
     thread (in-process path), and `app/workers/runtime.py::run_autonomous_task`
     calls it directly inside a Celery worker (queued path, lease-guarded).
     Safe to call for a task that already has a live handle — no-op then."""
-    if is_running(task_id):
+    handle = _claim_handle(task_id)
+    if handle is None:
         logger.debug("execute_task_sync: task %s already has a live handle.", task_id)
         return
-    handle = _get_or_create_handle(task_id)
     loop = AutonomousAgentLoop(task_id, handle)
     _run_and_cleanup(task_id, loop)
 
@@ -211,7 +232,23 @@ def reconcile_orphaned_tasks_on_startup(db) -> int:
         # driving it — not orphaned. No-op without Redis (is_held always
         # False), so single-process startup recovery is unchanged. This is
         # also what makes it safe to call periodically, not just at startup.
-        if lease.is_held(_LEASE_KIND, task_id):
+        #
+        # A Redis outage must not abort the WHOLE pass. `lease.is_held` reads
+        # Redis with no guard of its own, so one unreachable server used to
+        # propagate straight out of this function and leave EVERY orphan
+        # unreconciled — exactly the failure this function exists to prevent,
+        # caused by the recovery mechanism itself. Skipping this one task is
+        # the conservative outcome: a task nobody is driving stays put for the
+        # next pass, and a task a live worker IS driving is never failed out
+        # from under it.
+        try:
+            if lease.is_held(_LEASE_KIND, task_id):
+                continue
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "Task %s: lease lookup failed (was %s) — skipping it this pass.",
+                task_id, prior_status, exc_info=True,
+            )
             continue
         # ERROR ISOLATION. One unreconcilable task must not abort the pass and
         # leave every later orphan blocking its job — that is the exact failure

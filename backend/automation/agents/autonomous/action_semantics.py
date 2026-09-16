@@ -45,8 +45,17 @@ IRREVERSIBLE_ACTIONS = frozenset({"SUBMIT"})
 # In particular, "Apply Now" is never a submit synonym: on a listing it means
 # start/open the application. Final submission needs explicit finality language.
 # ---------------------------------------------------------------------------
+#
+# `\bsubmit\b` rather than `^submit\b`: real ATS forms label the final control
+# "Finish & Submit", "Review and Submit" or "I agree — Submit", and a
+# start-anchored pattern let every one of those past BOTH the semantic
+# classifier and `executor.py`'s approval gate purely by word order. The word
+# "submit" anywhere in a control's accessible name is the signal; ordinary
+# intermediate controls ("Next", "Save and Continue", "Apply Now") do not
+# contain it, so this does not widen the gate to them. A bare "Submit" is
+# still disambiguated by page context in `classify_semantic_action` below.
 SUBMIT_BUTTON_PATTERNS = [
-    r"^submit\b", r"submit\s*(my\s*)?application",
+    r"\bsubmit\b", r"submit\s*(my\s*)?application",
     r"finish\s*application", r"complete\s*application", r"send\s*application",
 ]
 _SUBMIT_RE = re.compile("|".join(SUBMIT_BUTTON_PATTERNS), re.IGNORECASE)

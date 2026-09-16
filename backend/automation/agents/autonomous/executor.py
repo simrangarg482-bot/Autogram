@@ -28,12 +28,14 @@ into a `REQUEST_HUMAN_INTERVENTION`-style pause instead of crashing the task.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
 
 from playwright.sync_api import Error as PlaywrightError, Page
 
+from automation.agents.autonomous import recovery
 from automation.agents.autonomous.action_semantics import (
     is_submit_control_name,
 )
@@ -70,6 +72,21 @@ SENSITIVE_FIELD_PATTERNS = [
     r"social\s*security", r"\bssn\b", r"i\s*certify", r"i\s*declare",
     r"legally\s*binding", r"under\s*penalty", r"date\s*of\s*birth", r"\bdob\b",
     r"arbitrat", r"\bagreement\b", r"\bconsent\b", r"\bai\s*policy\b",
+    # Real-world phrasings this gate missed while
+    # `question_ontology.SENSITIVE_COARSE_CATEGORIES` (the other, independent
+    # layer) correctly calls them sensitive — the two layers must agree (see
+    # `test_sensitive_field_corpus.py`). Most notably `\bagreement\b` did NOT
+    # match the far more common "I agree to ..." attestation wording, and
+    # `citizenship` did not match a bare "Are you a U.S. citizen?".
+    # Widening a gate that only ever escalates to a human is always the safe
+    # direction; a false positive costs one extra confirmation.
+    r"\bcitizens?\b", r"\bnationalit", r"permanent\s*resident", r"green\s*card",
+    r"work\s*permit", r"right\s*to\s*work", r"employment\s*eligibility",
+    r"\bwork\s*status\b", r"background\s*(screening|verification)",
+    r"drug\s*(test|screen)", r"substance\s*screening",
+    r"i\s*agree", r"i\s*acknowledge", r"i\s*attest", r"i\s*consent",
+    r"\battestation\b", r"\bdeclaration\b", r"security\s*clearance",
+    r"\bpronouns?\b", r"sexual\s*orientation", r"marital\s*status",
 ]
 _SENSITIVE_RE = re.compile("|".join(SENSITIVE_FIELD_PATTERNS), re.IGNORECASE)
 
@@ -133,6 +150,40 @@ def normalize_upload_path(path: str | None) -> str:
 
 def _locator_for_ref(page: Page, element_ref: int):
     return page.locator(f'[data-agent-ref="{element_ref}"]')
+
+
+def _annotate_failure_code(result: ActionResult, *, exception_message: str | None = None) -> ActionResult:
+    """Best-effort `recovery.classify_failure` labelling of an already-built
+    `ActionResult` (spec §11). Deliberately additive and non-raising: the
+    dispatch outcome is decided entirely by the `_do_*` handlers as before,
+    this only attaches a machine-readable WHY so `loop.py` can call
+    `recovery.recovery_policy` instead of re-deriving a reason from prose.
+
+    Three rules, all conservative:
+    - a successful, verified action is never labelled;
+    - a POLICY refusal (`blocked_reason`) is never labelled — it is not a
+      failure to recover from, it is the safety gate working, and `loop.py`
+      already has a dedicated branch per `blocked_reason`;
+    - anything the classifier can't place stays `None`, never a guess."""
+    if result.failure_code is not None:
+        return result
+    if result.blocked_reason is not None:
+        return result
+    if result.success and result.verified and exception_message is None:
+        return result
+    try:
+        code = recovery.classify_failure(
+            page_error_code=(result.postcondition if result.result_code in ("ERROR_PAGE", "NAVIGATION_FAILED") else None),
+            action_succeeded=bool(result.success),
+            action_verified=bool(result.verified),
+            exception_message=exception_message,
+        )
+    except Exception:  # noqa: BLE001 — classification is observability, never a new failure mode
+        logger.debug("Failure classification failed for a %s action.", result.action_type, exc_info=True)
+        return result
+    if code is None:
+        return result
+    return dataclasses.replace(result, failure_code=code)
 
 
 class ActionExecutor:
@@ -220,9 +271,12 @@ class ActionExecutor:
             dispatch = getattr(self, f"_do_{action.action_type}", None)
             if dispatch is None:
                 return ActionResult(False, action.action_type, "No handler for this action type.", blocked_reason="unimplemented")
-            return dispatch(action)
+            return _annotate_failure_code(dispatch(action))
         except PlaywrightError as e:
-            return ActionResult(False, action.action_type, f"Playwright error: {e}", verified=False)
+            return _annotate_failure_code(
+                ActionResult(False, action.action_type, f"Playwright error: {e}", verified=False),
+                exception_message=str(e),
+            )
 
     # ------------------------------------------------------------------
 
@@ -231,8 +285,8 @@ class ActionExecutor:
         response = self.page.goto(action.url, wait_until="domcontentloaded", timeout=30000)
         try:
             wait_for_page_settled(self.page, timeout_ms=10_000)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - a settle-wait failing must never block reporting the navigation
+            logger.debug("navigate: settle-wait failed (continuing): %s", e)
         status = getattr(response, "status", None)
         error = detect_error_page(self.page, response_status=status)
         if error is not None:
@@ -281,8 +335,8 @@ class ActionExecutor:
             return ActionResult(False, "click", "Click did not succeed", verified=False)
         try:
             wait_for_page_settled(self.page, timeout_ms=_CLICK_VERIFY_SETTLE_MS)
-        except Exception:  # noqa: BLE001 - a settle-wait failing must never block reporting the click
-            pass
+        except Exception as e:  # noqa: BLE001 - a settle-wait failing must never block reporting the click
+            logger.debug("click: settle-wait failed (verification falls back to the signature diff): %s", e)
         after = self._safe_signature()
         changed = before is not None and after is not None and after.differs_from(before)
         verified = changed
@@ -505,8 +559,8 @@ class ActionExecutor:
         try:
             if locator.evaluate("el => el.tagName") == "INPUT":
                 return locator
-        except Exception:  # noqa: BLE001 - detached/gone element, fall through to search
-            pass
+        except Exception as e:  # noqa: BLE001 - detached/gone element, fall through to search
+            logger.debug("upload: could not read the target's tag, trying a scoped search: %s", e)
         scoped = locator.locator(
             "xpath=ancestor::*[self::form or self::fieldset "
             "or contains(@class,'upload') or contains(@class,'attach')][1]"
@@ -515,14 +569,14 @@ class ActionExecutor:
         try:
             if scoped.count() == 1:
                 return scoped.first
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - fall through to the page-wide search
+            logger.debug("upload: scoped file-input search failed: %s", e)
         page_wide = self.page.locator("input[type='file']")
         try:
             if page_wide.count() == 1:
                 return page_wide.first
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001 - no safe candidate; the caller returns None
+            logger.debug("upload: page-wide file-input search failed: %s", e)
         return None
 
     def _do_extract_text(self, action: AgentAction) -> ActionResult:
