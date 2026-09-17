@@ -182,11 +182,39 @@ def request_cancel(task_id: str) -> bool:
 
 
 def _run_and_cleanup(task_id: str, loop: AutonomousAgentLoop) -> None:
+    """Runs the loop, then — the part that's easy to get backwards — only
+    forgets this task's handle if the browser is actually closed.
+
+    `loop.run()` returns in two shapes: every "browser left open deliberately"
+    exit (`MAX_ITERATIONS_PER_RESUME`, a `_check_budgets` "STOP") returns
+    WITHOUT calling `_close_browser()`, precisely so a human can still look at
+    where the run got stuck — see those call sites' own comments. But popping
+    `_REGISTRY` unconditionally here undoes that the instant this function
+    returns: `handle` (and the `BrowserManager`/`Page`/Playwright driver
+    connection it holds) then has no live Python reference anywhere — not in
+    `_REGISTRY`, not on this now-dead thread's stack — and becomes eligible
+    for garbage collection, which tears down the driver connection and, for a
+    browser we own (`persistent`/`launch` mode), the Chromium process with it.
+    That is exactly the failure `application_flow_manager._OPEN_REVIEW_SESSIONS`
+    exists to prevent for the deterministic flow's `copilot_review` browsers
+    (see its docstring) — the same fix applies here: keep the entry (and its
+    strong reference) in `_REGISTRY` for as long as `handle.browser_manager`
+    is still set, i.e. for as long as `_close_browser()` was never called.
+
+    Only a genuinely finished run — one that DID call `_close_browser()`,
+    which always sets `handle.browser_manager = None` — is forgotten here."""
     try:
         loop.run()
     finally:
-        with _REGISTRY_LOCK:
-            _REGISTRY.pop(task_id, None)
+        if loop.handle.browser_manager is None:
+            with _REGISTRY_LOCK:
+                _REGISTRY.pop(task_id, None)
+        else:
+            logger.info(
+                "Task %s: run() returned with its browser deliberately left open — "
+                "keeping its handle registered so the reference (and the browser) survive.",
+                task_id,
+            )
 
 
 def reconcile_orphaned_tasks_on_startup(db) -> int:
