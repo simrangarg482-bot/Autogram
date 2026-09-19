@@ -67,6 +67,7 @@ from typing import Callable
 
 from playwright.sync_api import Error as PlaywrightError, Locator, Page
 
+from automation.forms.country_dial_codes import COUNTRY_DIAL_CODES
 from automation.utils.element_actions import safe_click, wait_for_dynamic_element
 from automation.utils.human_input import human_pause_between_fields, human_type
 from automation.utils.scrolling import scroll_container_until_option_found
@@ -256,6 +257,19 @@ _COUNTRY_ALIASES = {
 def _canonical_country(text: str) -> str:
     normalized = _normalize_for_compare(text)
     return _COUNTRY_ALIASES.get(normalized, normalized)
+
+
+def _country_with_dial_code(value) -> str:
+    """"India" -> "India +91" (and "USA" -> "United States +1"). A country dropdown
+    whose options read "India +91" keeps BOTH "British Indian Ocean Territory +246"
+    and "India +91" as matches for "India", and the first loses; the full label
+    leaves one. Returned unchanged when it already carries a code or the country is
+    not in `COUNTRY_DIAL_CODES`."""
+    text = str(value).strip()
+    if re.search(r"\+\d", text):
+        return text
+    entry = COUNTRY_DIAL_CODES.get(_canonical_country(text))
+    return f"{entry[0]} +{entry[1]}" if entry else text
 
 
 def _coerce_date_string(value) -> str:
@@ -1782,8 +1796,33 @@ class CountryPickerHandler(_DropdownHandler):
         return _values_match(expected, actual)
 
     def fill(self, field: Field, value) -> None:
-        super().fill(field, value)
+        with_code = _country_with_dial_code(value)
+        super().fill(field, with_code)
+        if with_code != value and self._nothing_selected(field, with_code):
+            # This widget's options carry no dialing codes, so "India +91" matched
+            # none of them. Type the plain name, as before.
+            super().fill(field, value)
         logger.info("Country selected: %r for %r.", value, field.label)
+
+    def _nothing_selected(self, field: Field, typed: str) -> bool:
+        """True when the search found no option: the widget reports no selection and
+        the search box still holds what was typed (react-select empties it on a
+        choice). Not `verify()`: that reads the box's text back, so leftover typed
+        text would pass for a selection."""
+        for probe in (_selected_option_via_active_descendant, _selected_option_via_aria_controls):
+            chosen = probe(field)
+            if chosen and self._matches(chosen, typed):
+                return False
+        try:
+            box = _field_search_input(field) or field.locator
+            return box.input_value().strip() == typed
+        except PlaywrightError:
+            return False
+
+    def verify(self, field: Field, value) -> tuple[bool, str | None]:
+        # The control may display only the code ("+91"), which the plain name
+        # can never match; the labelled form ("India +91") matches it.
+        return super().verify(field, _country_with_dial_code(value))
 
 
 class VirtualizedListboxHandler(FieldHandler):

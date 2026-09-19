@@ -24,7 +24,9 @@ from playwright.sync_api import Locator, Page
 
 from automation.forms.field_handlers import (
     Field,
+    _DISPLAY_VALUE_SELECTOR,
     _committed_value_from_hidden_twin,
+    _display_value_scopes,
     _has_inspectable_options,
     _read_dropdown_displayed_value,
     _selected_option_via_active_descendant,
@@ -77,3 +79,37 @@ def verify_combobox_commit(locator: Locator, page: Page, expected_value: str | N
     if actual or observed_any:
         return False, actual or observed_any
     return None, None
+
+
+def selection_is_displayed(locator: Locator, page: Page, expected_value: str | None) -> bool:
+    """Strict: True ONLY when the widget itself shows `expected_value` as its
+    committed selection — an ARIA signal, a hidden twin, or the rendered
+    single-value element (react-select's `select__single-value`).
+
+    Deliberately NOT `verify_combobox_commit`'s last-resort read of the input's
+    own text. A searchable combobox still holds whatever the automation typed to
+    filter it, so a value the dropdown does not offer ("Germany" against a list
+    without it) would "verify" from its own leftover keystrokes. For a saved
+    protected-class answer that is a false success on a field nothing was
+    selected in, and false-positive verification is worse than a false negative
+    (spec section 15/20): a widget exposing none of these signals is reported as
+    unconfirmed and left to a human."""
+    if not expected_value:
+        return False
+    field = Field(locator=locator, page=page, label="", tag_name="", input_type=None, role="combobox")
+    for probe in (
+        _selected_option_via_active_descendant,
+        _selected_option_via_aria_controls,
+        _committed_value_from_hidden_twin,
+    ):
+        observed = probe(field)
+        if observed is not None and _values_match(expected_value, observed):
+            return True
+    for scope in _display_value_scopes(field):
+        try:
+            near = scope.locator(_DISPLAY_VALUE_SELECTOR)
+            if near.count() > 0 and _values_match(expected_value, (near.first.text_content() or "").strip()):
+                return True
+        except Exception:  # noqa: BLE001 - a scope that cannot be read is simply not evidence
+            continue
+    return False

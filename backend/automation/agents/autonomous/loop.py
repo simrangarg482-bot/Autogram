@@ -24,7 +24,7 @@ from __future__ import annotations
 import base64
 import logging
 import threading
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass, field as dc_field, replace as dc_replace
 
 from playwright.sync_api import Page
 
@@ -45,11 +45,15 @@ from automation.agents.autonomous.page_classifier import classify_page
 from automation.agents.autonomous.page_graph import PageGraph
 from automation.agents.autonomous.question_ledger import QuestionLedger, QuestionLedgerEntry
 from automation.agents.autonomous.question_ontology import classify_field
+from automation.agents.autonomous.saved_demographics import (
+    MAX_PREPASS_ATTEMPTS, SavedDemographicAnswer, find_pending_answer, saved_demographics_of, stored_answer_for,
+)
 from automation.agents.autonomous.state_machine import (
     validate_coarse_transition,
     validate_substate_transition,
 )
-from automation.agents.autonomous.truth_store import TruthStore, decide as decide_answer
+from automation.agents.autonomous.truth_store import AnswerDecision, TruthStore, VerifiedFact, decide as decide_answer
+from automation.forms.demographic_matching import is_stored_answer
 from automation.agents.autonomous.observer import (
     CONFIRMATION_PHRASES,
     PageState,
@@ -147,6 +151,14 @@ class TaskHandle:
     #: second browser round-trip (`page_navigator.py::capture_page_signature`,
     #: reused as-is — see `_loop_body`).
     last_page_signature: PageSignature | None = None
+    #: Per-run tries of the saved-demographic pre-pass, keyed by
+    #: `observer.field_identity` (see `saved_demographics.py`). In-process only.
+    demographic_prepass_attempts: dict = dc_field(default_factory=dict)
+    #: The saved-demographic answer the pre-pass is executing RIGHT NOW. Set by
+    #: code just before dispatch and cleared right after; `_answer_decision`
+    #: accepts a value as sourced only when it is exactly this. Deliberately
+    #: not carried on `AgentAction.extra`, which the model can populate.
+    pending_demographic: SavedDemographicAnswer | None = None
     #: Whether the LAST executed action (across all `_handle_execute_action`
     #: outcomes, including a blocked one) was confirmed to have an effect.
     #: Starts True so the very first iteration never reads as "already
@@ -609,6 +621,56 @@ class AutonomousAgentLoop:
         )
         return True
 
+    def _next_saved_demographic_decision(self, task, page_state: PageState) -> Decision | None:
+        """A synthetic EXECUTE_ACTION for the next empty demographic dropdown the
+        user has a saved answer for, or `None`. Never raises: the pre-pass is an
+        optimisation over the normal flow, so any failure here just means the
+        model/human path handles the field as it always did."""
+        saved = saved_demographics_of(task.candidate_profile)
+        if not saved or self.handle.page is None:
+            return None
+        try:
+            pending = find_pending_answer(
+                self.handle.page, page_state, saved, self.handle.demographic_prepass_attempts,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("Task %s: saved-demographic lookup failed.", self.task_id, exc_info=True)
+            return None
+        if pending is None:
+            return None
+        identity = field_identity(pending.element)
+        self.handle.demographic_prepass_attempts[identity] = (
+            self.handle.demographic_prepass_attempts.get(identity, 0) + 1
+        )
+        logger.info(
+            "Task %s: filling %r from the user's saved %s answer.", self.task_id, pending.element.name, pending.category,
+        )
+        return Decision(
+            decision_type="EXECUTE_ACTION",
+            action=AgentAction(action_type="select", element_ref=pending.element.ref, value=pending.value),
+            reasoning="Using the answer saved in the user's Application Profile.",
+            raw={"saved_demographic": pending},
+        )
+
+    def _saved_demographic_source(self, task, match, value: str | None) -> str | None:
+        """The saved answer `value` is exactly equal to for this field, or `None`.
+
+        Two ways to qualify, both requiring the value to BE the user's answer:
+        it is what the pre-pass is executing right now (code-set state), or -
+        for an action the model chose itself - `is_stored_answer` confirms it is
+        the very option the saved value resolves to. Anything else, including a
+        model's own guess at a demographic option, is not sourced."""
+        if match is None or not value:
+            return None
+        found = stored_answer_for(match, saved_demographics_of(task.candidate_profile))
+        if found is None:
+            return None
+        _category, stored = found
+        pending = self.handle.pending_demographic
+        if pending is not None and pending.element.ref == match.ref and pending.value == value:
+            return stored
+        return stored if is_stored_answer(stored, value, match.options or ()) else None
+
     def _truth_store(self, task) -> TruthStore:
         """A `TruthStore` over exactly the sources this task already carries —
         no new DB reads, no cross-application answer memory (that lookup stays
@@ -639,6 +701,16 @@ class AutonomousAgentLoop:
         spec says need the user, so for those the provenance policy decides
         on its own: only a fact the user actually supplied for that label
         makes the tick sourced."""
+        saved = self._saved_demographic_source(task, match, value)
+        if saved is not None:
+            # A demographic answer the user explicitly saved, written verbatim.
+            # `executor.py`'s sensitive-field gate is unchanged and still runs on
+            # this - it is passed `is_sourced=True` only because the value is
+            # exactly what the user saved, never because the model proposed it.
+            return True, AnswerDecision(
+                True, VerifiedFact(value, "USER_PROFILE", True), True, False,
+                "verified answer the user saved in their Application Profile - permitted",
+            ), classify_field(match)
         legacy_sourced = self._value_is_sourced(task, value)
         if match is None:
             return legacy_sourced, None, None
@@ -893,6 +965,28 @@ class AutonomousAgentLoop:
                 continue
             if current_signature is not None:
                 self.handle.last_page_signature = current_signature
+
+            # Saved EEO answers are applied deterministically, BEFORE the model
+            # is consulted: it is never given them, so left to itself it could
+            # only guess or ask a human. Goes through the same
+            # `_handle_execute_action` (grounding, sensitive-field gate, field
+            # ledger) as any model-chosen action.
+            saved_decision = self._next_saved_demographic_decision(task, page_state)
+            if saved_decision is not None:
+                pending = saved_decision.raw["saved_demographic"]
+                self.handle.pending_demographic = pending
+                try:
+                    keep_going = self._handle_execute_action(db, task, page_state, saved_decision)
+                finally:
+                    self.handle.pending_demographic = None
+                if self.handle.last_action_verified:
+                    # A react-select's search input stays empty after a choice, so the
+                    # observer keeps reading it as unfilled; record it as done here
+                    # rather than re-selecting it on the next iteration.
+                    self.handle.demographic_prepass_attempts[field_identity(pending.element)] = MAX_PREPASS_ATTEMPTS
+                if not keep_going:
+                    self._wait_for_resume()
+                continue
 
             self._set_substate("DECIDING")
             self.handle.budgets.record_llm_call()
@@ -1251,6 +1345,17 @@ class AutonomousAgentLoop:
         # the LLM ever proposed for a field matching this pattern is worth
         # more in the audit trail than knowing the agent tried.
         logged_value = "[REDACTED]" if element_name and is_verification_code_field_name(element_name) else action.value
+        if (
+            answer_decision is not None and answer_decision.fact is not None
+            and answer_decision.fact.source == "USER_PROFILE" and match is not None
+            and stored_answer_for(match, saved_demographics_of(task.candidate_profile)) is not None
+        ):
+            # A saved demographic answer is protected-class data. `action_history`
+            # is read back into the model's prompt, so neither the value nor a
+            # `detail` that echoes it may be recorded there.
+            logged_value = "[SAVED ANSWER]"
+            if action.value:
+                result = dc_replace(result, detail=result.detail.replace(action.value, "[saved answer]"))
         task_repo.append_action(db, task, {
             "action_type": action.action_type, "element_ref": action.element_ref,
             "element_name": element_name, "value": logged_value, "url": action.url,

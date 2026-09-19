@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { Loader2, Save, Plus, Trash2, GraduationCap, Briefcase, Sparkles, UserCircle2, CloudUpload } from "lucide-react";
 import { api } from "../api";
+import ApplicationProfileSection from "../components/ApplicationProfileSection";
 
 const FIELD_GROUPS = [
   {
@@ -281,7 +282,7 @@ export default function Profile({ toast }) {
 
       <nav className="section-nav" aria-label="Profile sections">
         {FIELD_GROUPS.map((group, index) => <a key={group.title} href={`#profile-section-${index}`}>{group.title}</a>)}
-        <a href="#profile-screening">Screening</a><a href="#profile-education">Education</a><a href="#profile-experience">Experience</a><a href="#profile-skills">Skills</a>
+        <a href="#profile-screening">Screening</a><a href="#profile-application">Application profile</a><a href="#profile-education">Education</a><a href="#profile-experience">Experience</a><a href="#profile-skills">Skills</a>
       </nav>
       {FIELD_GROUPS.map((group, index) => (
         <div id={`profile-section-${index}`} key={group.title} className="card p-6">
@@ -324,6 +325,9 @@ export default function Profile({ toast }) {
         </div>
         <SectionSaveButton saving={saving} onClick={save} />
       </div>
+
+      {/* Voluntary EEO answers — its own resource (candidate_demographics), saved independently of the profile fields above. */}
+      <ApplicationProfileSection toast={toast} profileExists={exists} />
 
       {/* Education */}
       <div id="profile-education" className="card p-6">

@@ -15,10 +15,13 @@ import logging
 import uuid
 from datetime import datetime, timezone
 
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from app.core.crypto import decrypt_field, encrypt_field
-from app.models.db_models import CandidateDemographics, CandidateProfile, EducationEntry, ExperienceEntry, ProfileDocument
+from app.models.db_models import (
+    CandidateDemographics, CandidateProfile, EducationEntry, ExperienceEntry, ProfileDocument, User,
+)
 from automation.forms.field_mapper import FieldMapper
 
 logger = logging.getLogger(__name__)
@@ -390,8 +393,63 @@ def delete_document(db: Session, document: ProfileDocument) -> None:
 
 _DEMOGRAPHICS_FIELDS = [
     "gender", "veteran_status", "disability_status", "race_ethnicity",
-    "pronouns", "ethnicities",
+    "hispanic_latino", "pronouns", "ethnicities",
 ]
+
+
+class DemographicsOwnershipError(RuntimeError):
+    """Saved demographic answers were about to be used for an application whose
+    user they do not belong to. Raised instead of quietly answering with
+    another person's protected-class data."""
+
+
+def detached_copy(instance):
+    """A plain, session-free copy of a mapped row: every COLUMN value, none of the
+    session. Built for a run that outlives its DB session (the browser phase of an
+    application is minutes long) — reading an attribute of the returned object can
+    never touch the database, so it can never raise `PendingRollbackError` or
+    `DetachedInstanceError` from a session that died mid-run. The copy is
+    transient: never added to a session, so nothing it holds can be flushed."""
+    cls = type(instance)
+    return cls(**{attr.key: getattr(instance, attr.key) for attr in sa_inspect(cls).column_attrs})
+
+
+def load_owned_demographics(db: Session, *, user_id: str, profile: CandidateProfile) -> CandidateDemographics | None:
+    """The saved demographics for `user_id`'s OWN profile as a detached copy, or
+    `None` if they never saved any.
+
+    Ownership is verified, not assumed: the profile must belong to `user_id`, and
+    the demographics row found must hang off a profile that belongs to `user_id`
+    too. A mismatch raises `DemographicsOwnershipError` — the caller must fail
+    the run rather than use, or silently skip, someone else's answers. Never a
+    global/first row: the only lookup is by this user's profile id.
+
+    Logs which ACCOUNT the answers were loaded for (email + ids) and which fields
+    are set — never the values — so "I saved them but they weren't used" can be
+    answered from the log by comparing accounts."""
+    if profile is None or profile.user_id != user_id:
+        raise DemographicsOwnershipError(
+            f"profile {getattr(profile, 'profile_id', None)!r} does not belong to user {user_id!r}."
+        )
+    row = get_demographics(db, profile.profile_id)
+    email = db.query(User.email).filter(User.user_id == user_id).scalar()
+    if row is None:
+        logger.info(
+            "Demographics: none saved for account %s (user_id=%s, profile_id=%s).",
+            email, user_id, profile.profile_id,
+        )
+        return None
+    owner_id = db.query(CandidateProfile.user_id).filter(CandidateProfile.profile_id == row.candidate_id).scalar()
+    if owner_id != user_id:
+        raise DemographicsOwnershipError(
+            f"demographics row {row.id!r} belongs to user {owner_id!r}, not to {user_id!r}."
+        )
+    copy = detached_copy(row)
+    logger.info(
+        "Demographics: loaded for account %s (user_id=%s, profile_id=%s); fields set: %s.",
+        email, user_id, profile.profile_id, sorted(f for f in _DEMOGRAPHICS_FIELDS if getattr(copy, f, None)),
+    )
+    return copy
 
 
 def get_demographics(db: Session, profile_id: str) -> CandidateDemographics | None:

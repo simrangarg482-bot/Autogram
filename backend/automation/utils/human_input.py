@@ -43,13 +43,13 @@ HUMAN_PACING_ENV = "AUTOMATION_HUMAN_PACING"
 _FALSEY = {"0", "false", "no", "off", ""}
 
 #: After scrolling a field into view, before touching it.
-SCROLL_SETTLE_MS = (500, 1200)
+SCROLL_SETTLE_MS = (250, 600)
 #: Between clicking a field and starting to type.
-PRE_TYPE_MS = (200, 500)
+PRE_TYPE_MS = (100, 250)
 #: Per-character typing delay.
-PER_CHAR_MS = (30, 90)
+PER_CHAR_MS = (15, 45)
 #: After a field is done, before the next one is touched.
-INTER_FIELD_MS = 2000
+INTER_FIELD_MS = 1000
 
 #: Characters typed per re-rolled delay. Playwright's `press_sequentially`
 #: takes ONE delay for the whole string, so a literal per-character random

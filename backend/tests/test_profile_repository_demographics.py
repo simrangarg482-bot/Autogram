@@ -341,3 +341,52 @@ def test_upsert_demographics_stores_pronouns_and_the_ethnicity_list():
     added = db.add.call_args[0][0]
     assert added.pronouns == "they/them"
     assert added.ethnicities == ["Asian", "White / Caucasian"]
+
+
+# ---------- Hispanic/Latino (its own yes/no EEO question) ----------
+
+def test_upsert_demographics_stores_hispanic_latino():
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = None
+
+    upsert_demographics(db, "profile-1", {"hispanic_latino": "no", "race_ethnicity": "Asian"})
+
+    added = db.add.call_args[0][0]
+    assert added.hispanic_latino == "no"
+    assert added.race_ethnicity == "Asian"
+
+
+def test_put_demographics_accepts_the_hispanic_latino_vocabulary_and_null_to_clear():
+    with patch("app.api.profile.repo.get_by_user_id", return_value=_fake_profile()), \
+         patch("app.api.profile.repo.upsert_demographics", return_value=MagicMock()) as upsert:
+        for value in ("yes", "no", "decline_to_answer", None):
+            put_demographics(
+                body=DemographicsRequest(hispanic_latino=value), user=MagicMock(user_id="u1"), db=MagicMock(),
+            )
+            # An explicit null reaches the repository, which is how a user clears an answer.
+            assert upsert.call_args[0][2] == {"hispanic_latino": value}
+
+
+@pytest.mark.parametrize("endpoint", [create_demographics, put_demographics])
+def test_hispanic_latino_rejects_values_outside_its_vocabulary(endpoint):
+    with patch("app.api.profile.repo.get_by_user_id", return_value=_fake_profile()), \
+         patch("app.api.profile.repo.get_demographics", return_value=None), \
+         patch("app.api.profile.repo.upsert_demographics") as upsert:
+        with pytest.raises(HTTPException) as exc_info:
+            endpoint(body=DemographicsRequest(hispanic_latino="maybe"), user=MagicMock(user_id="u1"), db=MagicMock())
+
+    assert exc_info.value.status_code == 400
+    assert "hispanic_latino" in exc_info.value.detail
+    upsert.assert_not_called()
+
+
+def test_demographics_are_read_and_written_only_for_the_callers_own_profile():
+    """The row is keyed by the LOGGED-IN user's profile: a different user's
+    profile id can never be reached through these endpoints."""
+    mine = MagicMock(profile_id="profile-mine")
+    with patch("app.api.profile.repo.get_by_user_id", return_value=mine) as by_user, \
+         patch("app.api.profile.repo.upsert_demographics", return_value=MagicMock()) as upsert:
+        put_demographics(body=DemographicsRequest(gender="male"), user=MagicMock(user_id="u-me"), db=MagicMock())
+
+    assert by_user.call_args[0][1] == "u-me"
+    assert upsert.call_args[0][1] == "profile-mine"

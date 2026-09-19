@@ -15,6 +15,7 @@ extension/node_modules/
 
 # Python virtual environment
 venv/
+.venv/
 
 # Python cache
 __pycache__/

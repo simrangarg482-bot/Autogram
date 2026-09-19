@@ -26,6 +26,7 @@ from app.models.db_models import (
     VALID_DOCUMENT_TYPES,
     VALID_EMPLOYMENT_TYPES,
     VALID_GENDER_VALUES,
+    VALID_HISPANIC_LATINO_VALUES,
     VALID_LANGUAGE_PROFICIENCIES,
     VALID_REMOTE_PREFERENCES,
     VALID_TRUST_LEVELS,
@@ -144,6 +145,7 @@ def _validate_demographic_choices(data: dict) -> None:
     _validate_choice(data.get("gender"), VALID_GENDER_VALUES, "gender")
     _validate_choice(data.get("veteran_status"), VALID_VETERAN_STATUS_VALUES, "veteran_status")
     _validate_choice(data.get("disability_status"), VALID_DISABILITY_STATUS_VALUES, "disability_status")
+    _validate_choice(data.get("hispanic_latino"), VALID_HISPANIC_LATINO_VALUES, "hispanic_latino")
 
 
 def _validate_profile_choices(data: dict) -> None:
@@ -630,6 +632,10 @@ def delete_document(
 def get_demographics(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     profile = _get_owned_profile(db, user)
     entry = repo.get_demographics(db, profile.profile_id)
+    logger.info(
+        "Demographics read for account %s (user_id=%s, profile_id=%s): %s.",
+        user.email, user.user_id, profile.profile_id, "saved" if entry is not None else "none saved",
+    )
     if entry is None:
         # Every field defaults to None — "never asked" — rather than 404,
         # so a caller can always GET this endpoint to check what (if
@@ -664,6 +670,10 @@ def create_demographics(
         )
     data = body.model_dump(exclude_unset=True)
     _validate_demographic_choices(data)
+    logger.info(
+        "Demographics created for account %s (user_id=%s, profile_id=%s); fields: %s.",
+        user.email, user.user_id, profile.profile_id, sorted(data),
+    )
     return repo.upsert_demographics(db, profile.profile_id, data)
 
 
@@ -680,4 +690,8 @@ def put_demographics(
     profile = _get_owned_profile(db, user)
     data = body.model_dump(exclude_unset=True)
     _validate_demographic_choices(data)
+    logger.info(
+        "Demographics saved for account %s (user_id=%s, profile_id=%s); fields: %s.",
+        user.email, user.user_id, profile.profile_id, sorted(data),
+    )
     return repo.upsert_demographics(db, profile.profile_id, data)

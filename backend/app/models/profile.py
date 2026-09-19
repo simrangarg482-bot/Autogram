@@ -474,6 +474,7 @@ class DemographicsRequest(BaseModel):
     veteran_status: str | None = None      # see VALID_VETERAN_STATUS_VALUES
     disability_status: str | None = None   # see VALID_DISABILITY_STATUS_VALUES
     race_ethnicity: str | None = None      # free text — categories vary by country/form
+    hispanic_latino: str | None = None     # see VALID_HISPANIC_LATINO_VALUES
     # Free text, unvalidated, both of them — deliberately. Pronoun sets are
     # open-ended (one live form offers nine plus "Custom") and ethnicity
     # categories differ by country, so a closed enum here would reject
@@ -491,6 +492,7 @@ class DemographicsResponse(BaseModel):
     veteran_status: str | None = None
     disability_status: str | None = None
     race_ethnicity: str | None = None
+    hispanic_latino: str | None = None
     pronouns: str | None = None
     ethnicities: list[str] | None = None
     created_at: datetime | None = None

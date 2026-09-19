@@ -750,16 +750,25 @@ so through the autonomous path, which handles a prior deterministic submission
 notice period, clearance, languages, highest education level, ...), the full
 `resume_text`, and `parsed_resume` — which is where **education and work
 history** arrive (`ParsedResume.education[]` / `.experience[]`); the
-`education`/`experience` child tables are not snapshotted separately. Two
-deliberate exclusions, documented on that function:
+`education`/`experience` child tables are not snapshotted separately. One
+addition and one deliberate exclusion, documented on that function:
 
-* **`CandidateDemographics`** (race/gender/veteran/disability) is withheld, so
-  `executor.py`'s sensitive-field gate turns any such question into a human
-  pause. The deterministic path *does* read demographics
-  (`automation/forms/answer_engine.py`). This asymmetry is intentional — the
-  autonomous path never fills protected-class answers on the candidate's
-  behalf — and it is the one place where the agent pauses for data that does
-  technically exist in the database.
+* **`CandidateDemographics`** (gender / disability / veteran / race /
+  Hispanic-Latino) is snapshotted under its own `demographics` key — but only
+  what the user explicitly saved in the **Application profile** section of the
+  Profile page. It is kept out of everything the LLM is sent (`decision.py`
+  gets only `profile`, `resume_text`, `parsed_resume`, and the pre-pass redacts
+  the value from `action_history`, which is read back into the prompt). Before
+  each LLM decision, `loop.py::_next_saved_demographic_decision`
+  (`saved_demographics.py`) fills any empty demographic dropdown the user has
+  a saved answer for: the answer is resolved against the field's REAL options
+  and applied through `_handle_execute_action`, so grounding, the field ledger
+  and `executor.py`'s sensitive-field gate all still run — the gate passes only
+  because the value equals the saved answer. A field with **no** saved answer,
+  or a saved value the form has no option for, behaves exactly as before: a
+  human pause. `select` on a non-native dropdown (react-select) opens it and
+  clicks the `role="option"` (`executor.py::_select_custom_option`); it never
+  calls `select_option()` on one.
 * **`answer_cache` / `application_questions`** are not consulted, so a
   free-text question already answered on a *different* application is asked
   again rather than auto-answered from another context.

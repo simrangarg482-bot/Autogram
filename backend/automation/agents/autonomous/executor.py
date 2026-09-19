@@ -40,10 +40,11 @@ from automation.agents.autonomous.action_semantics import (
     is_submit_control_name,
 )
 from automation.agents.autonomous.actions import ActionResult, AgentAction
-from automation.agents.autonomous.combobox_verify import verify_combobox_commit
+from automation.agents.autonomous.combobox_verify import selection_is_displayed, verify_combobox_commit
 from automation.agents.autonomous.observer import observe_page
 from automation.agents.autonomous.page_validation import detect_error_page
 from automation.applications.page_navigator import advance_to_next_page, capture_page_signature, wait_for_page_settled
+from automation.forms.field_handlers import describe_field, fill_field
 from automation.utils.element_actions import safe_click
 from automation.utils.human_input import human_type
 
@@ -67,7 +68,7 @@ SENSITIVE_FIELD_PATTERNS = [
     r"eligib\w*\s*(to\s*work|for\s*employment)", r"eligib\w*.{0,20}\bwork\b",
     r"legally\s*(authorized|permitted|entitled|eligible)",
     r"\bvisa\b", r"sponsor", r"citizenship", r"\bimmigration\b",
-    r"\brace\b", r"ethnicit", r"\bgender\b", r"\bsex\b", r"veteran",
+    r"\brace\b", r"ethnicit", r"\bhispanic\b", r"\blatin[oax@]s?\b", r"\bgender\b", r"\bsex\b", r"veteran",
     r"disabilit", r"criminal", r"felony", r"convict", r"background\s*check",
     r"social\s*security", r"\bssn\b", r"i\s*certify", r"i\s*declare",
     r"legally\s*binding", r"under\s*penalty", r"date\s*of\s*birth", r"\bdob\b",
@@ -444,6 +445,8 @@ class ActionExecutor:
 
     def _do_select(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)
+        if not self._is_native_select(locator):
+            return self._select_custom_option(locator, action)
         try:
             locator.select_option(label=action.value)
         except PlaywrightError:
@@ -453,6 +456,44 @@ class ActionExecutor:
         if not verified:
             detail += " (could not confirm the option is actually selected)"
         return ActionResult(True, "select", detail, verified=verified)
+
+    @staticmethod
+    def _is_native_select(locator) -> bool:
+        return (locator.evaluate("el => (el.tagName || '').toLowerCase()") or "") == "select"
+
+    def _select_custom_option(self, locator, action: AgentAction) -> ActionResult:
+        """`select` on a custom dropdown — react-select, an ARIA combobox/listbox.
+
+        Playwright's `select_option()` only works on a native `<select>`; on
+        Greenhouse's react-select it raised "Element is not a <select> element"
+        every time, so a model that chose `select` for a custom dropdown could
+        never succeed. Delegates to the same field-handler machinery the
+        deterministic engine uses: open the dropdown, find the `role="option"`
+        whose text matches, click it, and verify the widget now displays it."""
+        field = describe_field(
+            locator, label=locator.get_attribute("aria-label") or "", page=self.page,
+            profile_attribute="autonomous_select",
+        )
+        outcome = fill_field(field, action.value)
+        # `fill_field`'s own verification also accepts the text typed into the
+        # search box, so it can report success for a value the dropdown never
+        # offered. Success here additionally requires the widget itself to show
+        # the selection.
+        if outcome.filled and selection_is_displayed(locator, self.page, action.value):
+            return ActionResult(
+                True, "select", f"Selected {action.value!r} in custom dropdown element ref {action.element_ref}",
+                verified=True, result_code="ACTION_SUCCEEDED",
+                postcondition="dropdown displays the chosen option",
+            )
+        reason = (
+            outcome.failure.failure_reason if outcome.failure
+            else "the dropdown does not show that option as selected" if outcome.filled else "unknown"
+        )
+        return ActionResult(
+            False, "select",
+            f"Could not select {action.value!r} in custom dropdown element ref {action.element_ref} ({reason})",
+            verified=False,
+        )
 
     def _do_check(self, action: AgentAction) -> ActionResult:
         locator = _locator_for_ref(self.page, action.element_ref)

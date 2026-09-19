@@ -93,6 +93,7 @@ _FINE_TO_COARSE = {
     "demographic_veteran_status": "DEMOGRAPHICS",
     "demographic_disability_status": "DEMOGRAPHICS",
     "demographic_race_ethnicity": "DEMOGRAPHICS",
+    "demographic_hispanic_latino": "DEMOGRAPHICS",
     "demographic_pronouns": "DEMOGRAPHICS",
 }
 
@@ -185,7 +186,7 @@ _SENSITIVE_STRUCTURAL_PATTERNS: list[tuple[str, re.Pattern]] = [
         re.IGNORECASE,
     )),
     ("DEMOGRAPHICS", re.compile(
-        r"\brace\b|ethnicit|\bgender\b|\bsex\b|veteran|disabilit|\bpronouns?\b"
+        r"\brace\b|ethnicit|\bhispanic\b|\blatin[oax@]s?\b|\bgender\b|\bsex\b|veteran|disabilit|\bpronouns?\b"
         r"|date\s*of\s*birth|\bdob\b|sexual\s*orientation|marital\s*status",
         re.IGNORECASE,
     )),

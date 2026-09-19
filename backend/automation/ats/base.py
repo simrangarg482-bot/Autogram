@@ -76,6 +76,8 @@ from automation.browser.selectors import (
 )
 from automation.forms.answer_engine import (
     DETERMINISTIC_CONFIDENCE,
+    SOURCE_NEEDS_USER_INPUT,
+    AnswerResult,
     ApplicationAnswerEngine,
     Question,
 )
@@ -1316,6 +1318,27 @@ class ATSAdapter(ABC):
         self._mark_examined(input_locator)
         self._pending_answer_engine_questions.append((text, input_locator))
 
+    def _answer_questions_individually(self, questions: list[Question]) -> list[AnswerResult]:
+        """The fallback for a failed `answer_batch`: one call per question. A question
+        that still fails is reported (warning, with the real exception) and left
+        unanswered - `SOURCE_NEEDS_USER_INPUT`, zero confidence, empty answer - which
+        the caller already treats as "a human answers this"; every other question
+        keeps its answer."""
+        answers: list[AnswerResult] = []
+        for question in questions:
+            try:
+                answers.append(self.answer_engine.answer_batch([question])[0])
+            except Exception as e:  # noqa: BLE001 - isolate this one question
+                logger.warning(
+                    "%s: could not answer %r (%s: %s) - leaving it unanswered.",
+                    self.name, question.text, type(e).__name__, e, exc_info=True,
+                )
+                answers.append(AnswerResult(
+                    question=question.text, answer="", source=SOURCE_NEEDS_USER_INPUT, confidence=0.0,
+                    available_options=question.options,
+                ))
+        return answers
+
     def _fill_questions_via_answer_engine(self) -> list[FieldFillResult]:
         """Phase 6: batches every labeled-but-unmatched question collected
         during the label pass into ONE `ApplicationAnswerEngine.answer_batch()`
@@ -1357,14 +1380,16 @@ class ATSAdapter(ABC):
         try:
             answers = self.answer_engine.answer_batch(questions)
         except Exception as e:  # noqa: BLE001 - a broken AnswerEngine call must never abort the whole sweep
-            logger.debug(
-                "ApplicationAnswerEngine batch call failed (%s) — leaving %d question(s) unanswered.",
-                e, len(pending),
+            # Was `logger.debug` and abandoned every question in the batch, which is
+            # how one failed database call silently left a whole form unanswered with
+            # nothing in the log to say why. Now says what failed, and gives each
+            # question its own chance so one bad one cannot take the rest down.
+            logger.warning(
+                "%s: ApplicationAnswerEngine failed for a batch of %d question(s) (%s: %s) - "
+                "retrying each question on its own.",
+                self.name, len(pending), type(e).__name__, e, exc_info=True,
             )
-            return [
-                FieldFillResult(field_key=text, profile_path=None, value_used=None, confidence=0.0, filled=False)
-                for text, _ in pending
-            ]
+            answers = self._answer_questions_individually(questions)
 
         results: list[FieldFillResult] = []
         for (text, _input_locator), field, answer_result in zip(pending, fields, answers):

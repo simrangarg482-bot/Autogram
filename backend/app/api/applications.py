@@ -74,6 +74,7 @@ from automation.coordination import control, lease
 from automation.ats.detector import FALLBACK_ATS, detect_ats_for_url
 from automation.ats.registry import get_adapter_class
 from automation.forms.answer_engine import ApplicationAnswerEngine, is_decoy_field
+from automation.forms.resume_context import load_resume_context
 from automation.forms.vision_fallback import VisionFormAnswerer
 
 logger = logging.getLogger(__name__)
@@ -1037,6 +1038,12 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             return
 
         application = application_repository.mark_processing(db, application)
+        # Plain values for everything the browser phase needs from the application.
+        # `application` is an ORM row on `db`; once `db` is closed (below) or has
+        # failed, reading an attribute of it raises. The lambdas handed to the flow
+        # manager must never capture the row itself.
+        run_user_id = application.user_id
+        run_job_url = application.job_url
         _emit(application_id, "APPLICATION_STARTED", job_url=application.job_url)
 
         try:
@@ -1110,6 +1117,27 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
         application.resume_used = resume_document.document_id
         db.commit()
 
+        # Everything the browser phase reads from the database is loaded NOW, into
+        # plain data, and `db` is closed before the browser opens (see below). The
+        # phase is minutes long; a Neon connection idle that long is dropped, and a
+        # session holding ORM objects then raises `PendingRollbackError` from what
+        # looks like a plain attribute read.
+        #
+        # Demographics are loaded through the USER'S OWN profile and verified to
+        # belong to `run_user_id`; a mismatch fails the run rather than answering
+        # protected-class questions from someone else's data.
+        try:
+            demographics = profile_repository.load_owned_demographics(db, user_id=run_user_id, profile=profile)
+        except profile_repository.DemographicsOwnershipError as error:
+            logger.error("Application %s: %s", application_id, error)
+            application.status = "failed"
+            application.failure_reason = f"Refusing to use saved demographic answers: {error}"
+            db.commit()
+            return
+        resume_context = load_resume_context(db, profile)
+        profile = profile_repository.detached_copy(profile)
+        resume_document = profile_repository.detached_copy(resume_document)
+
         # Phase 6: answers screening questions FieldMapper (Phase 5) can't
         # resolve to a known profile field — deterministic facts (notice
         # period, salary, work authorization, years of experience) straight
@@ -1120,9 +1148,13 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
         # take down the whole run over what's meant to be a best-effort
         # enhancement, so it's caught and logged instead.
         try:
+            # No `db=`: the engine opens a short-lived session of its own for each cache /
+            # ledger operation (`session_factory`), so nothing in it can be left holding
+            # the run's session. Demographics and résumé facts were preloaded above.
             answer_engine = ApplicationAnswerEngine(
-                profile=profile, job_description=job_description, db=db, user_id=application.user_id,
-                application_id=application.application_id,
+                profile=profile, job_description=job_description, user_id=run_user_id,
+                application_id=application_id, demographics=demographics, resume_context=resume_context,
+                session_factory=SessionLocal,
             )
         except Exception:
             logger.exception("Application %s: could not build ApplicationAnswerEngine — continuing without it.", application_id)
@@ -1170,9 +1202,13 @@ def _run_application(application_id: str, resume_document_id: str, job_descripti
             answer_engine=answer_engine,
             vision_answerer=vision_answerer,
             on_waiting_for_human=lambda reason: _mark_waiting_for_human(application_id, reason),
-            is_kill_switch_engaged=lambda: _is_kill_switch_engaged(application.user_id),
-            resolve_trust_level=lambda: _resolve_trust_level_for(application.user_id, application.job_url),
+            is_kill_switch_engaged=lambda: _is_kill_switch_engaged(run_user_id),
+            resolve_trust_level=lambda: _resolve_trust_level_for(run_user_id, run_job_url),
         )
+        # Release the run's session BEFORE the long browser phase. Every later
+        # database operation opens its own (the callbacks above, the engine's
+        # `session_factory`, and `result_db` for the final write).
+        db.close()
         # See _run_on_dedicated_thread's docstring: Playwright's sync API
         # must run on a thread that was never touched by asyncio AND won't
         # be handed to some other run later if this one leaves its browser

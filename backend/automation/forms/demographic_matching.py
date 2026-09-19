@@ -44,7 +44,7 @@ from __future__ import annotations
 
 from typing import Iterable, Sequence
 
-from automation.forms.option_matching import match_option
+from automation.forms.option_matching import match_option, normalize_option
 
 #: Every "I'd rather not say" wording seen across real EEO forms, shared by all
 #: four demographic categories. One list rather than per-category ones because
@@ -54,6 +54,11 @@ from automation.forms.option_matching import match_option
 #: other being in the list.
 _DECLINE_PHRASINGS: tuple[str, ...] = (
     "Decline to self-identify",
+    # Greenhouse's own wording — "Decline To Self Identify", no hyphen. The
+    # hyphenated form above is not equal to it and not contained in it, so a
+    # stored `decline_to_answer` matched nothing on a live Greenhouse gender
+    # dropdown and left the question for a human.
+    "Decline to self identify",
     "I decline to self-identify",
     "I don't wish to answer",
     "I do not wish to answer",
@@ -116,6 +121,13 @@ CANONICAL_OPTION_PHRASINGS: dict[str, tuple[str, ...]] = {
         "No",
     ),
 
+    # --- Hispanic/Latino (VALID_HISPANIC_LATINO_VALUES) ---
+    # "yes"/"no" are tried as stored first (a plain Yes/No/Decline list matches
+    # on that directly); these are for forms that word the answer as the
+    # ethnicity itself.
+    "yes": ("Yes", "Yes, I am Hispanic or Latino", "Hispanic or Latino", "Hispanic/Latino"),
+    "no": ("No", "No, I am not Hispanic or Latino", "Not Hispanic or Latino", "Not Hispanic/Latino"),
+
     # --- shared across every category ---
     "decline_to_answer": _DECLINE_PHRASINGS,
 
@@ -170,11 +182,48 @@ def match_demographic_value(stored_value: str, options: Sequence[str]) -> str | 
     `answer_engine._demographic_answer`)."""
     if not stored_value or not options:
         return None
+    declining = stored_value.strip().casefold() == "decline_to_answer"
     for candidate in option_candidates(stored_value):
         matched = match_option(candidate, options)
-        if matched is not None:
-            return matched
+        if matched is None:
+            continue
+        # `match_option`'s containment tier is bidirectional, so a decline
+        # phrasing such as "Prefer not to say" resolves to a bare "No" (which is
+        # contained in "not"). On a Yes/No/Decline list that would answer a
+        # demographic question "No" for someone who chose NOT TO ANSWER. A
+        # decline may only ever land on an option that is itself a decline.
+        if declining and normalize_option(matched) in _YES_NO:
+            continue
+        return matched
     return None
+
+
+_YES_NO = frozenset({"yes", "no"})
+
+
+def is_stored_answer(stored_value: str, value: str, options: Sequence[str] = ()) -> bool:
+    """Whether `value` is EXACTLY what the candidate's stored demographic answer
+    means — the check the autonomous agent uses to decide a value it is about to
+    type is "sourced".
+
+    Stricter than `match_demographic_value` on purpose. That function answers
+    "which of these real options is the stored value?" and may use containment;
+    this one answers "is this specific string that answer?", and a wrong "yes"
+    writes a protected-class answer the candidate never gave:
+
+    - with the page's `options` known: `value` must be the very option the stored
+      value resolves to — so a model's guess of any OTHER option is refused;
+    - with no options visible (a closed react-select exposes none): `value` must
+      be, after case/whitespace normalization, one of the stored value's own
+      candidate phrasings. Containment is not used here — "I do not want to
+      answer" contains "no" and must not count as the stored answer "no"."""
+    if not stored_value or not value:
+        return False
+    if options:
+        resolved = match_demographic_value(stored_value, options)
+        return resolved is not None and normalize_option(resolved) == normalize_option(value)
+    wanted = normalize_option(value)
+    return any(normalize_option(candidate) == wanted for candidate in option_candidates(stored_value))
 
 
 def match_demographic_values(stored_values: Iterable[str], options: Sequence[str]) -> list[str]:

@@ -195,6 +195,31 @@ def _json_safe_profile(profile_dict: dict | None) -> dict | None:
     return safe
 
 
+#: The `CandidateDemographics` columns the agent may answer from. Pronouns are
+#: included because the deterministic path answers them the same way; an
+#: unset column is simply absent from the snapshot ("never asked").
+_SNAPSHOT_DEMOGRAPHIC_FIELDS = (
+    "gender", "veteran_status", "disability_status", "race_ethnicity",
+    "hispanic_latino", "pronouns",
+)
+
+
+def _saved_demographics(db: Session, profile) -> dict:
+    """The user's saved demographic answers as `{column: value}`, set columns
+    only. Empty when there is no profile or nothing was ever saved."""
+    if profile is None:
+        return {}
+    entry = profile_repository.get_demographics(db, profile.profile_id)
+    if entry is None:
+        return {}
+    saved = {}
+    for name in _SNAPSHOT_DEMOGRAPHIC_FIELDS:
+        value = getattr(entry, name, None)
+        if isinstance(value, str) and value.strip():
+            saved[name] = value.strip()
+    return saved
+
+
 def _build_candidate_profile_snapshot(
     db: Session, user: User, resume_id: str | None, overrides: dict | None
 ) -> tuple[dict, list[dict]]:
@@ -215,12 +240,15 @@ def _build_candidate_profile_snapshot(
       history** reach the agent (`ParsedResume.education[]` /
       `.experience[]`) — the `education`/`experience` child TABLES are not
       snapshotted separately;
-    * NOT `CandidateDemographics` (race/gender/veteran/disability). Those are
-      protected-class answers the agent must never fill on the candidate's
-      behalf, so they are withheld and `executor.py`'s sensitive-field gate
-      turns any such field into a human pause. The deterministic per-ATS path
-      DOES read them (`automation/forms/answer_engine.py`); this asymmetry is
-      intentional, not an oversight.
+    * `CandidateDemographics` (gender/disability/veteran/race/Hispanic-Latino),
+      but ONLY the values the user explicitly saved in their Application
+      Profile, under their own `demographics` key. These are protected-class
+      answers, so they are deliberately kept out of everything the LLM is sent
+      (`decision.py` receives only `profile`, `resume_text` and
+      `parsed_resume`): the loop resolves them deterministically and writes
+      the saved answer itself (`loop.py::_saved_demographic_action`). A field
+      with NO saved answer is unchanged — `executor.py`'s sensitive-field gate
+      still turns it into a human pause. Nothing here is ever inferred.
     * NOT `answer_cache` or `application_questions` — answers approved on
       other applications are not reused here, so a repeated free-text
       question is asked again rather than auto-answered from another context.
@@ -252,6 +280,7 @@ def _build_candidate_profile_snapshot(
         # Already JSONB in the database, so already plain JSON types.
         "parsed_resume": (resume_record.parsed_data if resume_record else None),
         "resume_id": resume_record.resume_id if resume_record else None,
+        "demographics": _saved_demographics(db, profile),
     }
     if overrides:
         # Shallow-merge overrides into the profile view only — never mutates

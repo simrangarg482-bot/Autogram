@@ -81,10 +81,12 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
+from sqlalchemy.exc import PendingRollbackError
 from sqlalchemy.orm import Session
 
+from app.core.database import is_disconnect_error
 from app.services import answer_cache_repository, application_question_repository
 from automation.forms.demographic_matching import (
     match_demographic_value,
@@ -114,6 +116,7 @@ from automation.forms.question_classifier import (
     CATEGORY_WILLING_TO_TRAVEL,
     CATEGORY_WORK_AUTHORIZED,
     CATEGORY_YEARS_OF_EXPERIENCE,
+    DEMOGRAPHIC_STORAGE_FIELDS,
     MULTI_VALUE_DEMOGRAPHIC_CATEGORIES,
     classify_question,
     is_demographic,
@@ -153,6 +156,10 @@ from automation.interfaces import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: "The caller did not preload this" - distinct from `None`, which means "preloaded,
+#: and the candidate has nothing saved".
+_NOT_PROVIDED = object()
 
 
 class Question(str):
@@ -278,13 +285,7 @@ _DETERMINISTIC_FORMATTERS: dict[str, Callable[[CandidateProfile], str | None]] =
 
 #: CandidateDemographics attribute name for each demographic category —
 #: `_demographic_answer` reads straight off the stored row via this mapping.
-_DEMOGRAPHIC_PROFILE_FIELDS: dict[str, str] = {
-    "demographic_gender": "gender",
-    "demographic_veteran_status": "veteran_status",
-    "demographic_disability_status": "disability_status",
-    "demographic_race_ethnicity": "race_ethnicity",
-    "demographic_pronouns": "pronouns",
-}
+_DEMOGRAPHIC_PROFILE_FIELDS: dict[str, str] = DEMOGRAPHIC_STORAGE_FIELDS
 
 #: Where a MULTI_VALUE_DEMOGRAPHIC_CATEGORIES answer comes from: the list
 #: column first, falling back to the single-value column above. A candidate who
@@ -599,8 +600,30 @@ class ApplicationAnswerEngine:
         llm_fn: Callable[..., str] | None = None,
         resume_context: ResumeContext | None = None,
         application_id: str | None = None,
+        demographics=_NOT_PROVIDED,
+        session_factory: Callable[[], Session] | None = None,
     ):
+        """`demographics` / `resume_context` / `session_factory` exist so a run that
+        outlives its DB session (an application's browser phase is minutes long)
+        never depends on that session:
+
+        - `demographics` - the candidate's saved answers, loaded up front as plain
+          data (`profile_repository.load_owned_demographics`); `None` means "loaded,
+          none saved". Omitted, they are read on first use as before.
+        - `resume_context` - likewise, already a plain frozen dataclass.
+        - `session_factory` - every remaining DB operation (answer cache, question
+          ledger) opens its OWN short-lived session instead of borrowing `db`.
+        """
         self.profile = profile
+        # Plain values, read once NOW while `profile` is still usable. Everything
+        # later goes through these rather than `self.profile.<column>`: on an ORM
+        # profile whose session has since failed, ANY attribute read (even
+        # `getattr(..., None)`) re-loads from the DB and raises
+        # `PendingRollbackError`, which is how a dead session took down a whole
+        # batch of answers at what looked like a plain attribute access.
+        self._profile_id = getattr(profile, "profile_id", None)
+        self._profile_user_id = getattr(profile, "user_id", None)
+        self._session_factory = session_factory
         self.job_description = job_description
         self.db = db
         self.user_id = user_id
@@ -628,16 +651,63 @@ class ApplicationAnswerEngine:
         # row that will usually just be unused.
         self._demographics: CandidateDemographics | None = None
         self._demographics_loaded = False
+        if demographics is not _NOT_PROVIDED:
+            self._demographics = demographics
+            self._demographics_loaded = True
+
+    # ------------------------------------------------------------------
+    # Database access
+    # ------------------------------------------------------------------
+
+    def _has_db(self) -> bool:
+        return self.db is not None or self._session_factory is not None
+
+    def _run_db(self, operation: Callable[[Session], Any]):
+        """Runs `operation(session)` and, if the session turns out to be dead,
+        recovers and tries ONCE more.
+
+        A run holds its engine for minutes while a browser works; a Neon
+        connection idle that long is dropped, after which the session raises
+        `PendingRollbackError` (or a disconnect `DBAPIError`) on next use. With a
+        `session_factory` each attempt gets a brand-new short-lived session, closed
+        afterwards; otherwise the caller's `db` is rolled back and reused. Only
+        those two failure kinds are retried - a genuine query error is raised as-is."""
+        def attempt():
+            if self._session_factory is not None:
+                session = self._session_factory()
+                try:
+                    return operation(session)
+                finally:
+                    session.close()
+            return operation(self.db)
+
+        try:
+            return attempt()
+        except Exception as first:  # noqa: BLE001 - filtered right below
+            if not (isinstance(first, PendingRollbackError) or is_disconnect_error(first)):
+                raise
+            logger.warning(
+                "Database session failed mid-run (%s: %s) - recovering and retrying once.",
+                type(first).__name__, str(first).splitlines()[0][:120],
+            )
+            if self._session_factory is None:
+                try:
+                    self.db.rollback()
+                except Exception:  # noqa: BLE001 - a rollback that fails is what the retry reports on
+                    logger.debug("Rollback of the failed session also failed.", exc_info=True)
+            return attempt()
 
     # ------------------------------------------------------------------
     # Cache
     # ------------------------------------------------------------------
 
     def _cache_lookup(self, question: Question) -> AnswerResult | None:
-        if self.db is None or self.user_id is None:
+        if not self._has_db() or self.user_id is None:
             return None
         try:
-            cached = answer_cache_repository.get_cached_answer(self.db, self.user_id, question.text)
+            cached = self._run_db(
+                lambda db: answer_cache_repository.get_cached_answer(db, self.user_id, question.text)
+            )
             source = "cache"
             if cached is None:
                 # Exact-hash miss — try a semantic near-duplicate before ever
@@ -646,7 +716,9 @@ class ApplicationAnswerEngine:
                 # as "answer_memory" to the per-question ledger, same as an
                 # exact-hash hit — the review UI cares whether this came from
                 # the candidate's own history, not which lookup found it.
-                cached = answer_cache_repository.find_similar_answer(self.db, self.user_id, question.text)
+                cached = self._run_db(
+                    lambda db: answer_cache_repository.find_similar_answer(db, self.user_id, question.text)
+                )
                 source = "answer_memory"
         except Exception:  # noqa: BLE001 - a broken cache lookup must never block answering
             logger.debug("Answer cache lookup failed for %r — answering fresh instead.", question.text)
@@ -685,7 +757,7 @@ class ApplicationAnswerEngine:
         questions, and surfacing one to a human is worse than noise: filling a
         honeypot is precisely how a site identifies a submission as automated.
         """
-        if self.db is None or self.application_id is None:
+        if not self._has_db() or self.application_id is None:
             return
         if is_decoy_field(result.question):
             logger.debug(
@@ -694,8 +766,8 @@ class ApplicationAnswerEngine:
             )
             return
         try:
-            application_question_repository.record_question(
-                self.db,
+            self._run_db(lambda db: application_question_repository.record_question(
+                db,
                 self.application_id,
                 question_text=result.question,
                 source=self._QUESTION_SOURCE_MAP.get(result.source, "llm"),
@@ -704,7 +776,7 @@ class ApplicationAnswerEngine:
                 field_type="options" if question.options else "text",
                 available_options=list(question.options) if question.options else None,
                 answer=result.answer or None,
-            )
+            ))
         except Exception:  # noqa: BLE001 - never let ledger bookkeeping break answering
             logger.debug("Could not record question %r to the application ledger — continuing.", result.question)
 
@@ -717,12 +789,12 @@ class ApplicationAnswerEngine:
         # input", typed a 6-digit code into one.
         if is_decoy_field(question):
             return
-        if self.db is None or self.user_id is None or not answer:
+        if not self._has_db() or self.user_id is None or not answer:
             return
         try:
-            answer_cache_repository.save_answer(
-                self.db, self.user_id, question, answer=answer, source=source, confidence=confidence,
-            )
+            self._run_db(lambda db: answer_cache_repository.save_answer(
+                db, self.user_id, question, answer=answer, source=source, confidence=confidence,
+            ))
         except Exception:  # noqa: BLE001 - a failed cache write must never break an otherwise-good answer
             logger.debug("Could not cache the answer for %r — continuing without it.", question)
 
@@ -738,13 +810,26 @@ class ApplicationAnswerEngine:
         as an error."""
         if not self._demographics_loaded:
             self._demographics_loaded = True
-            if self.db is not None:
-                profile_id = getattr(self.profile, "profile_id", None)
-                if profile_id:
-                    try:
-                        self._demographics = get_candidate_demographics(self.db, profile_id)
-                    except Exception:  # noqa: BLE001 - a broken lookup must never crash the run
-                        logger.debug("Could not load candidate_demographics for %r — treating as unanswered.", profile_id)
+            # `self._profile_id`, NOT `self.profile.profile_id`: see `__init__`.
+            profile_id = self._profile_id
+            if self._has_db() and profile_id:
+                try:
+                    row = self._run_db(lambda db: get_candidate_demographics(db, profile_id))
+                except Exception:  # noqa: BLE001 - a broken lookup must never crash the run
+                    logger.warning(
+                        "Could not load candidate_demographics for %r - treating those questions as unanswered.",
+                        profile_id, exc_info=True,
+                    )
+                    row = None
+                if row is not None and self.user_id and self._profile_user_id and self.user_id != self._profile_user_id:
+                    # The engine was built for one user but handed another's profile.
+                    # Never answer protected-class questions from that.
+                    logger.error(
+                        "Refusing to use saved demographics: engine user %r != profile owner %r.",
+                        self.user_id, self._profile_user_id,
+                    )
+                    row = None
+                self._demographics = row
         return self._demographics
 
     def _get_resume_context(self) -> ResumeContext:
@@ -754,7 +839,18 @@ class ApplicationAnswerEngine:
         queries to build a prompt nobody sends."""
         if not self._resume_context_loaded:
             self._resume_context_loaded = True
-            self._resume_context = load_resume_context(self.db, self.profile)
+            try:
+                if self._session_factory is not None:
+                    session = self._session_factory()
+                    try:
+                        self._resume_context = load_resume_context(session, self.profile)
+                    finally:
+                        session.close()
+                else:
+                    self._resume_context = load_resume_context(self.db, self.profile)
+            except Exception:  # noqa: BLE001 - enrichment only; never worth failing a batch over
+                logger.warning("Could not load resume context - answering from the base profile only.", exc_info=True)
+                self._resume_context = None
         return self._resume_context or ResumeContext()
 
     def _stored_demographic_value(self, category: str) -> str | None:

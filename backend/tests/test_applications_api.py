@@ -350,8 +350,9 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
     monkeypatch.setattr(applications_module, "SessionLocal", lambda: MagicMock())
     monkeypatch.setattr(applications_module, "detect_ats_for_url", lambda url: {"ats": "greenhouse", "confidence": 0.9})
     monkeypatch.setattr(applications_module, "get_adapter_class", lambda ats: MagicMock())
-    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: MagicMock(profile_id="profile-1"))
-    monkeypatch.setattr(applications_module.profile_repository, "get_document", lambda db, doc_id: MagicMock(document_id=doc_id))
+    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: _real_profile_and_document(uid)[0])
+    monkeypatch.setattr(applications_module.profile_repository, "get_document", lambda db, doc_id: _real_profile_and_document()[1])
+    _stub_snapshot_loaders(monkeypatch, applications_module)
     monkeypatch.setattr(applications_module.profile_repository, "list_documents", lambda db, pid, document_type=None: [MagicMock(document_id="doc-1", is_default=True)])
     monkeypatch.setattr(applications_module, "ApplicationAnswerEngine", lambda **kw: MagicMock())
     monkeypatch.setattr(applications_module, "_run_on_dedicated_thread", lambda fn: fn())
@@ -408,12 +409,36 @@ def test_start_application_retries_after_a_failure_and_stops_retrying_once_appli
 # ATS/browser/LLM behavior (covered elsewhere).
 # ---------------------------------------------------------------------------
 
+def _real_profile_and_document(user_id="user-1"):
+    """`_run_application` now copies the profile and résumé document into plain data
+    before the browser phase, and verifies demographics belong to the run's user - so
+    the wiring tests need real (unsaved) rows, not `MagicMock`s."""
+    from app.models.db_models import CandidateProfile, ProfileDocument
+
+    profile = CandidateProfile(profile_id="profile-1", user_id=user_id, first_name="Ada")
+    document = ProfileDocument(
+        document_id="doc-1", profile_id="profile-1", document_type="resume",
+        original_filename="cv.pdf", stored_path="storage/cv.pdf", file_hash="h",
+    )
+    return profile, document
+
+
+def _stub_snapshot_loaders(monkeypatch, applications_module, *, demographics=None):
+    """The two DB reads `_run_application` does up front, stubbed (no live DB here)."""
+    from automation.forms.resume_context import ResumeContext
+
+    monkeypatch.setattr(
+        applications_module.profile_repository, "load_owned_demographics",
+        lambda db, *, user_id, profile: demographics,
+    )
+    monkeypatch.setattr(applications_module, "load_resume_context", lambda db, profile: ResumeContext())
+
+
 def test_run_application_builds_an_answer_engine_with_the_job_description_and_passes_it_to_the_flow_manager(monkeypatch):
     import app.api.applications as applications_module
 
     fake_application = MagicMock(application_id="app-1", user_id="user-1", autopilot_enabled=False)
-    fake_profile = MagicMock()
-    fake_resume_document = MagicMock(document_id="doc-1")
+    fake_profile, fake_resume_document = _real_profile_and_document()
     fake_db = MagicMock()
 
     monkeypatch.setattr(applications_module, "SessionLocal", lambda: fake_db)
@@ -424,6 +449,7 @@ def test_run_application_builds_an_answer_engine_with_the_job_description_and_pa
     monkeypatch.setattr(applications_module, "get_adapter_class", lambda ats: MagicMock())
     monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: fake_profile)
     monkeypatch.setattr(applications_module.profile_repository, "get_document", lambda db, doc_id: fake_resume_document)
+    _stub_snapshot_loaders(monkeypatch, applications_module)
 
     captured = {}
 
@@ -448,9 +474,13 @@ def test_run_application_builds_an_answer_engine_with_the_job_description_and_pa
 
     applications_module._run_application("app-1", "doc-1", "We are hiring a backend engineer.")
 
-    assert captured["engine_kwargs"]["profile"] is fake_profile
+    # A plain copy of the profile, not the ORM row held by the run's session.
+    assert captured["engine_kwargs"]["profile"] is not fake_profile
+    assert captured["engine_kwargs"]["profile"].profile_id == "profile-1"
     assert captured["engine_kwargs"]["job_description"] == "We are hiring a backend engineer."
-    assert captured["engine_kwargs"]["db"] is fake_db
+    # The engine is NOT handed the run's session: it opens its own short-lived ones.
+    assert "db" not in captured["engine_kwargs"]
+    assert captured["engine_kwargs"]["session_factory"] is applications_module.SessionLocal
     assert captured["engine_kwargs"]["user_id"] == "user-1"
     assert captured["manager_kwargs"]["answer_engine"] is captured["engine_instance"]
 
@@ -462,7 +492,7 @@ def test_run_application_still_runs_when_building_the_answer_engine_fails(monkey
     import app.api.applications as applications_module
 
     fake_application = MagicMock(application_id="app-1", user_id="user-1", autopilot_enabled=False)
-    fake_resume_document = MagicMock(document_id="doc-1")
+    fake_profile, fake_resume_document = _real_profile_and_document()
     fake_db = MagicMock()
 
     monkeypatch.setattr(applications_module, "SessionLocal", lambda: fake_db)
@@ -471,8 +501,9 @@ def test_run_application_still_runs_when_building_the_answer_engine_fails(monkey
     monkeypatch.setattr(applications_module.application_repository, "apply_run_result", lambda db, app, result: None)
     monkeypatch.setattr(applications_module, "detect_ats_for_url", lambda url: {"ats": "greenhouse", "confidence": 0.9})
     monkeypatch.setattr(applications_module, "get_adapter_class", lambda ats: MagicMock())
-    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: MagicMock())
+    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: fake_profile)
     monkeypatch.setattr(applications_module.profile_repository, "get_document", lambda db, doc_id: fake_resume_document)
+    _stub_snapshot_loaders(monkeypatch, applications_module)
 
     def _broken_engine(**kwargs):
         raise RuntimeError("boom")
@@ -944,3 +975,147 @@ def test_report_application_status_404s_for_an_unowned_application(monkeypatch):
         report_application_status("app-1", body, user=MagicMock(user_id="user-1"), db=MagicMock())
 
     assert exc_info.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# The run must not depend on the DB session across the browser phase.
+#
+# Observed live (Warp/Greenhouse): one session was held for the ~405s browser phase,
+# Neon dropped the idle connection, and the next ORM attribute read raised
+# `PendingRollbackError`, abandoning every answer. `_run_application` now loads what
+# the run needs into plain data, closes its session BEFORE the browser opens, and
+# hands the engine a session FACTORY instead of a session.
+# ---------------------------------------------------------------------------
+
+def _wire_run(monkeypatch, *, application=None, demographics=None, ownership_error=None):
+    """Everything `_run_application` touches, stubbed; returns the capture dict."""
+    import app.api.applications as applications_module
+
+    application = application or MagicMock(application_id="app-1", user_id="user-1", job_url="https://x.test/j", autopilot_enabled=False)
+    profile, document = _real_profile_and_document()
+    fake_db = MagicMock()
+    events = []
+    fake_db.close.side_effect = lambda: events.append("db.close")
+    captured = {"events": events, "db": fake_db, "application": application}
+
+    monkeypatch.setattr(applications_module, "SessionLocal", lambda: fake_db)
+    monkeypatch.setattr(applications_module.application_repository, "get_by_id", lambda db, aid: application)
+    monkeypatch.setattr(applications_module.application_repository, "mark_processing", lambda db, app: application)
+    monkeypatch.setattr(applications_module.application_repository, "apply_run_result", lambda db, app, result: None)
+    monkeypatch.setattr(applications_module, "detect_ats_for_url", lambda url: {"ats": "greenhouse", "confidence": 0.9})
+    monkeypatch.setattr(applications_module, "get_adapter_class", lambda ats: MagicMock())
+    monkeypatch.setattr(applications_module.profile_repository, "get_by_user_id", lambda db, uid: profile)
+    monkeypatch.setattr(applications_module.profile_repository, "get_document", lambda db, doc_id: document)
+
+    if ownership_error is not None:
+        def _raise(db, *, user_id, profile):
+            raise ownership_error
+        monkeypatch.setattr(applications_module.profile_repository, "load_owned_demographics", _raise)
+        from automation.forms.resume_context import ResumeContext
+        monkeypatch.setattr(applications_module, "load_resume_context", lambda db, profile: ResumeContext())
+    else:
+        _stub_snapshot_loaders(monkeypatch, applications_module, demographics=demographics)
+
+    class _FakeEngine:
+        def __init__(self, **kwargs):
+            captured["engine_kwargs"] = kwargs
+
+    class _FakeManager:
+        def __init__(self, **kwargs):
+            captured["manager_kwargs"] = kwargs
+            events.append("manager.built")
+
+        def run(self):
+            events.append("manager.run")
+            return MagicMock()
+
+    monkeypatch.setattr(applications_module, "ApplicationAnswerEngine", _FakeEngine)
+    monkeypatch.setattr(applications_module, "ApplicationFlowManager", _FakeManager)
+    monkeypatch.setattr(applications_module, "_run_on_dedicated_thread", lambda fn: fn())
+    return applications_module, captured
+
+
+def test_the_runs_db_session_is_closed_before_the_browser_phase_starts(monkeypatch):
+    applications_module, captured = _wire_run(monkeypatch)
+
+    applications_module._run_application("app-1", "doc-1")
+
+    events = captured["events"]
+    assert events.index("db.close") < events.index("manager.run")
+
+
+def test_the_engine_is_given_preloaded_plain_data_and_a_session_factory_not_the_session(monkeypatch):
+    from app.models.db_models import CandidateDemographics
+
+    saved = CandidateDemographics(id="d1", candidate_id="profile-1", gender="male")
+    applications_module, captured = _wire_run(monkeypatch, demographics=saved)
+
+    applications_module._run_application("app-1", "doc-1")
+
+    kwargs = captured["engine_kwargs"]
+    assert kwargs["demographics"] is saved
+    assert kwargs["resume_context"] is not None
+    assert kwargs["session_factory"] is applications_module.SessionLocal
+    assert "db" not in kwargs
+
+
+def test_the_flow_manager_gets_detached_copies_of_the_profile_and_resume_document(monkeypatch):
+    from sqlalchemy import inspect as sa_inspect
+
+    applications_module, captured = _wire_run(monkeypatch)
+
+    applications_module._run_application("app-1", "doc-1")
+
+    for key in ("profile", "resume_document"):
+        assert sa_inspect(captured["manager_kwargs"][key]).transient, f"{key} is still tied to a session"
+
+
+def test_the_callbacks_handed_to_the_manager_do_not_read_the_orm_application_row(monkeypatch):
+    """`is_kill_switch_engaged` / `resolve_trust_level` run during the browser phase.
+    They used to close over `application`, an ORM row on the run's session: after that
+    session is closed or dead, reading `application.user_id` raises."""
+    class _DeadRow:
+        application_id = "app-1"
+        user_id = "user-1"
+        job_url = "https://x.test/j"
+        autopilot_enabled = False
+        dead = False
+
+        def __getattribute__(self, name):
+            if name in ("user_id", "job_url") and object.__getattribute__(self, "dead"):
+                raise RuntimeError("the application row's session died")
+            return object.__getattribute__(self, name)
+
+    row = _DeadRow()
+    applications_module, captured = _wire_run(monkeypatch, application=row)
+    seen = {}
+    monkeypatch.setattr(applications_module, "_is_kill_switch_engaged", lambda uid: seen.setdefault("kill", uid) or False)
+    monkeypatch.setattr(applications_module, "_resolve_trust_level_for", lambda uid, url: seen.setdefault("trust", (uid, url)))
+
+    applications_module._run_application("app-1", "doc-1")
+    row.dead = True     # the browser phase: the row can no longer be read
+
+    captured["manager_kwargs"]["is_kill_switch_engaged"]()
+    captured["manager_kwargs"]["resolve_trust_level"]()
+
+    assert seen["kill"] == "user-1"
+    assert seen["trust"] == ("user-1", "https://x.test/j")
+
+
+def test_demographics_that_do_not_belong_to_the_runs_user_fail_the_run_clearly(monkeypatch, caplog):
+    import logging
+
+    from app.services.profile_repository import DemographicsOwnershipError
+
+    application = MagicMock(application_id="app-1", user_id="user-1", job_url="https://x.test/j", autopilot_enabled=False)
+    error = DemographicsOwnershipError("demographics row 'd9' belongs to user 'user-2', not to 'user-1'.")
+    applications_module, captured = _wire_run(monkeypatch, application=application, ownership_error=error)
+
+    with caplog.at_level(logging.ERROR):
+        applications_module._run_application("app-1", "doc-1")
+
+    assert application.status == "failed"
+    assert "Refusing to use saved demographic answers" in application.failure_reason
+    assert "user-2" in application.failure_reason
+    assert "manager.built" not in captured["events"]        # no browser, no form filled with someone else's data
+    assert "belongs to user 'user-2'" in caplog.text

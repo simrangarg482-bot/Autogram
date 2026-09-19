@@ -1,24 +1,35 @@
-from sentence_transformers import SentenceTransformer
+import math
 
-EMBEDDING_DIM = 384  # matches all-MiniLM-L6-v2's output size
-
-# Lazy singleton: loading the model takes seconds and ~100MB — do it on first
-# use, not at import, so app startup (and anything importing this module
-# transitively) stays fast.
-_model: SentenceTransformer | None = None
+from fastembed import TextEmbedding
 
 
-def _get_model() -> SentenceTransformer:
+EMBEDDING_DIM = 384
+
+_model: TextEmbedding | None = None
+
+
+def _get_model() -> TextEmbedding:
     global _model
+
     if _model is None:
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
+        _model = TextEmbedding(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
+        )
+
     return _model
 
 
 def generate_embedding(text: str) -> list[float]:
     """
-    Generates a normalized embedding vector for the given text.
-    Normalized so cosine similarity reduces to a simple dot product later.
+    Generate a normalized 384-dimensional embedding.
+
+    Uses FastEmbed/ONNX instead of PyTorch.
     """
-    vector = _get_model().encode(text, normalize_embeddings=True)
-    return vector.tolist()
+    vector = list(_get_model().embed([text]))[0]
+
+    norm = math.sqrt(sum(float(x) * float(x) for x in vector))
+
+    if norm == 0:
+        return [0.0] * EMBEDDING_DIM
+
+    return [float(x) / norm for x in vector]

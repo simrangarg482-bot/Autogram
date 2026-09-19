@@ -32,6 +32,10 @@ VALID_DOCUMENT_TYPES = {"resume", "cover_letter", "certificate", "other"}
 VALID_GENDER_VALUES = {"male", "female", "non_binary", "decline_to_answer", "self_described"}
 VALID_VETERAN_STATUS_VALUES = {"veteran", "not_veteran", "decline_to_answer"}
 VALID_DISABILITY_STATUS_VALUES = {"has_disability", "no_disability", "decline_to_answer"}
+# Hispanic/Latino is its own yes/no EEO question on many boards (Greenhouse asks it
+# separately from Race), so it is stored separately rather than folded into
+# `race_ethnicity`.
+VALID_HISPANIC_LATINO_VALUES = {"yes", "no", "decline_to_answer"}
 VALID_EMPLOYMENT_TYPES = {"full_time", "part_time", "contract", "internship", "temporary", "no_preference"}
 # Language proficiency, coarsest distinction that matters to a form: an ATS asks
 # "are you fluent in X?" as a yes/no, and the honest answer depends on which
@@ -481,6 +485,7 @@ class CandidateDemographics(Base):
     veteran_status = Column(String, nullable=True)       # see VALID_VETERAN_STATUS_VALUES
     disability_status = Column(String, nullable=True)    # see VALID_DISABILITY_STATUS_VALUES
     race_ethnicity = Column(String, nullable=True)       # free text — EEO race/ethnicity categories vary by country/form
+    hispanic_latino = Column(String, nullable=True)      # see VALID_HISPANIC_LATINO_VALUES
 
     # Pronouns. Identity data, so it belongs here under the never-inferred rule
     # above rather than on CandidateProfile — and it is the single field where

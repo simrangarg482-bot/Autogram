@@ -88,6 +88,11 @@ CATEGORY_DEMOGRAPHIC_GENDER = "demographic_gender"
 CATEGORY_DEMOGRAPHIC_VETERAN_STATUS = "demographic_veteran_status"
 CATEGORY_DEMOGRAPHIC_DISABILITY_STATUS = "demographic_disability_status"
 CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY = "demographic_race_ethnicity"
+#: "Are you Hispanic/Latino?" — a yes/no question of its own on the EEOC form
+#: (Greenhouse asks it beside, not inside, Race), so it has its own category and
+#: its own stored column. See `_CATEGORY_REGEXES` for why it is matched by a
+#: start-anchored pattern rather than a phrase.
+CATEGORY_DEMOGRAPHIC_HISPANIC_LATINO = "demographic_hispanic_latino"
 CATEGORY_DEMOGRAPHIC_PRONOUNS = "demographic_pronouns"
 
 #: Every demographic category — `answer_engine.py` checks membership in this
@@ -102,8 +107,22 @@ DEMOGRAPHIC_CATEGORIES = frozenset({
     CATEGORY_DEMOGRAPHIC_VETERAN_STATUS,
     CATEGORY_DEMOGRAPHIC_DISABILITY_STATUS,
     CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY,
+    CATEGORY_DEMOGRAPHIC_HISPANIC_LATINO,
     CATEGORY_DEMOGRAPHIC_PRONOUNS,
 })
+
+#: Demographic category -> the `CandidateDemographics` column that holds the
+#: candidate's stored answer. Public so the deterministic engine and the
+#: autonomous agent resolve a question to the same column instead of keeping two
+#: copies that can drift.
+DEMOGRAPHIC_STORAGE_FIELDS: dict[str, str] = {
+    CATEGORY_DEMOGRAPHIC_GENDER: "gender",
+    CATEGORY_DEMOGRAPHIC_VETERAN_STATUS: "veteran_status",
+    CATEGORY_DEMOGRAPHIC_DISABILITY_STATUS: "disability_status",
+    CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY: "race_ethnicity",
+    CATEGORY_DEMOGRAPHIC_HISPANIC_LATINO: "hispanic_latino",
+    CATEGORY_DEMOGRAPHIC_PRONOUNS: "pronouns",
+}
 
 #: The demographic categories a form asks as "select all that apply" rather than
 #: pick-one — `answer_engine` reads a LIST of stored values for these (see
@@ -328,6 +347,12 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         "disability status", "do you have a disability", "self-identify as a person with a disability",
         "voluntary self-identification of disability",
     ]),
+    # BEFORE race/ethnicity: that bucket keeps the "hispanic or latino" phrase
+    # for Lever, whose race <select> is wrapped in a label that lists a
+    # "Hispanic or Latino" OPTION and is a race question. Only a question that
+    # itself LEADS with Hispanic/Latino is the separate yes/no one — see
+    # `_CATEGORY_REGEXES`. No phrases: it is matched by pattern alone.
+    (CATEGORY_DEMOGRAPHIC_HISPANIC_LATINO, []),
     (CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY, [
         "race/ethnicity", "race and ethnicity", "what is your race", "what is your ethnicity",
         "race or ethnic", "hispanic or latino",
@@ -340,6 +365,28 @@ _CATEGORY_PHRASES: list[tuple[str, list[str]]] = [
         "identify my ethnicity", "ethnicity", "ethnicities", "ethnic origin",
     ]),
 ]
+
+#: Patterns for categories a plain substring cannot express safely. Consulted
+#: in the same loop, and in the same position, as that category's phrases.
+#:
+#: - HISPANIC_LATINO is anchored to the START of the question ("Are you
+#:   Hispanic/Latino?", "Hispanic or Latino?"). Lever's race <select> recovers
+#:   as "Race Select... Hispanic or Latino White ..." — it merely lists the
+#:   option — and must stay a race question, so an unanchored match is wrong.
+#: - RACE needs a word boundary: a substring test would claim "embrace",
+#:   "grace", "trace" and "Are you racing...". "race condition" is a debugging
+#:   question, not an EEO one.
+_CATEGORY_REGEXES: dict[str, tuple[re.Pattern, ...]] = {
+    CATEGORY_DEMOGRAPHIC_HISPANIC_LATINO: (
+        re.compile(
+            r"^\W*(?:are you\s+|do you (?:identify as|consider yourself)\s+)?(?:of\s+)?"
+            r"(?:hispanic|latin[oax@]s?)\b.{0,4}\b(?:latin[oax@]?|hispanic)",
+        ),
+    ),
+    CATEGORY_DEMOGRAPHIC_RACE_ETHNICITY: (
+        re.compile(r"\brace\b(?!\s*condition)|\bracial\b"),
+    ),
+}
 
 _WHITESPACE = re.compile(r"\s+")
 
@@ -358,6 +405,8 @@ def classify_question(question: str) -> str | None:
         return None
     for category, phrases in _CATEGORY_PHRASES:
         if any(phrase in normalized for phrase in phrases):
+            return category
+        if any(pattern.search(normalized) for pattern in _CATEGORY_REGEXES.get(category, ())):
             return category
     return None
 
