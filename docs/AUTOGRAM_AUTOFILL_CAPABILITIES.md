@@ -19,6 +19,8 @@
 | iframe forms — single form iframe vs. top-level | YES | YES | HIGH | resolve_form_root compares control counts |
 | iframe forms — nested (iframe-in-iframe) | YES | YES | HIGH | page.frames is flat regardless of nesting depth; resolve_form_root already scans it correctly (verified — no bug found) |
 | iframe forms — form iframe with an OTHER, low-control-count widget iframe alongside it (e.g. résumé upload) | YES | YES | HIGH | Sept 2026 fix (B-004) |
+| iframe forms — conditional/follow-up field reveal, deterministic path | YES | YES | HIGH | A-005 fix: `_fill_page`'s round-loop signature now frame-scoped, was always blind before |
+| iframe forms — autonomous agent (Launch Agent) path | NO (by design) | YES | N/A | extraction script never descends into an iframe; a form rendered entirely inside one observes as zero elements and the agent correctly REFUSES completion + escalates to a human (`content_frame_count` in page_classifier.py/observer.py) rather than silently failing. Real capability gap (cannot fill such forms), safely handled, not a bug. Architectural — out of scope for a bounded fix. |
 | Cover-letter upload widget in a SEPARATE iframe from the résumé/main form | NO | NO | UNKNOWN | `find_cover_letter_upload_input` only searches `form_root` and only distinguishes resume-vs-cover-letter when BOTH file inputs are on the same root (needs ≥2 file inputs there to disambiguate) — same class of bug as B-004 but not yet fixed; lower real-world frequency (two separate third-party upload widgets on one posting is rare) so left as a documented gap rather than spec-fixed without a concrete repro |
 | Shadow DOM | UNKNOWN | NO | UNKNOWN | needs investigation |
 | Multi-step forms | YES | PARTIAL | MEDIUM | application_flow_manager.py |
