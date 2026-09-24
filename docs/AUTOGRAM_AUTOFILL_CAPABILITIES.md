@@ -5,9 +5,12 @@
 | Text input (label/aria/placeholder) | YES | YES | HIGH | field_mapper.py + describe_field; phone/first_name synonym gaps closed (telephone, cell phone/number, forename — A-003) |
 | Native select | YES | YES | HIGH | NativeSelectHandler |
 | react-select combobox | YES | YES | MEDIUM | ComboboxHandler; option-order ambiguity fixed for country, generalizable bug remains for other confusable-option dropdowns (see failures log) |
+| Autocomplete backed by real network latency (location/city/address/employer lookups) | YES | YES | HIGH | Sept 2026 fix (B-006) — `_DropdownHandler.fill()` now polls (~1.8s bounded) instead of a single fixed 300ms sleep; previously could false-positive "succeed" with nothing selected when options loaded late |
 | Country picker (name+dial code) | YES | YES | HIGH | CountryPickerHandler + country_dial_codes.py (Sept 2026 fix) |
 | Radio groups | YES | YES | HIGH | RadioHandler |
+| Radio groups — repeated field group sharing duplicate `name` (cloned template row) | YES | YES | HIGH | Sept 2026 fix (B-005) — _native_radio_group now scopes to nearest fieldset/role=group ancestor before falling back to page-global lookup |
 | Checkbox / checkbox groups | YES | YES | HIGH | CheckboxHandler |
+| Checkbox — repeated field group sharing duplicate `id` (cloned template row) | YES | YES | HIGH | Sept 2026 fix (B-005) — label-click skipped when ambiguous (getElementById mismatch) + every click attempt now self-verified before returning success |
 | Autonomous agent select() on custom dropdown | YES | YES | MEDIUM | executor.py _select_custom_option (opens+clicks role=option, was calling select_option() before fix) |
 | Demographics (gender/disability/veteran/race/hispanic) | YES | YES | HIGH | answer_engine.py, never LLM-answered, saved via Application Profile UI |
 | DB session resilience across long browser runs | YES | YES | HIGH | answer_engine.py session_factory + _run_db retry-once |

@@ -95,7 +95,9 @@ def scroll_into_view(locator: Locator, page: Page) -> None:
     _pause(page, SCROLL_SETTLE_MS)
 
 
-def human_type(locator: Locator, text: str, page: Page, *, click_first: bool = True) -> None:
+def human_type(
+    locator: Locator, text: str, page: Page, *, click_first: bool = True, timeout_ms: int | None = None,
+) -> None:
     """Scroll → settle → click → settle → clear → type in jittered chunks.
 
     Falls back to a plain `fill()` when pacing is disabled, when the text is
@@ -107,10 +109,22 @@ def human_type(locator: Locator, text: str, page: Page, *, click_first: bool = T
     click would be actively harmful — notably a custom dropdown's search box,
     which is focused the moment the menu opens and whose trigger would toggle
     the menu shut if clicked again.
+
+    `timeout_ms` bounds every `fill()` call here (`None` = Playwright's own
+    30s default, unchanged for every caller that doesn't pass it — and the
+    kwarg is omitted entirely rather than passed as `timeout=None`, so a test
+    double implementing only Playwright's own `fill(value)` signature, with
+    no `timeout` parameter at all, is unaffected too). A locator that will
+    never resolve — its element remounted with a new id between
+    `describe_field()` and this call — otherwise blocks the full 30s on this
+    call alone, and `fill_field()`'s 3-attempt retry loop calls this per
+    attempt, so one permanently-dead field could cost minutes before being
+    reported. `click()`'s own short explicit timeout below is unaffected.
     """
     text = str(text)
+    fill_kwargs = {"timeout": timeout_ms} if timeout_ms is not None else {}
     if not human_pacing_enabled() or len(text) > MAX_TYPED_CHARS:
-        locator.fill(text)
+        locator.fill(text, **fill_kwargs)
         return
 
     scroll_into_view(locator, page)
@@ -122,12 +136,12 @@ def human_type(locator: Locator, text: str, page: Page, *, click_first: bool = T
             logger.debug("Could not click a field before typing (%s) — typing anyway.", e)
 
     try:
-        locator.fill("")  # press_sequentially appends; clear whatever was there
+        locator.fill("", **fill_kwargs)  # press_sequentially appends; clear whatever was there
         for start in range(0, len(text), _CHUNK_CHARS):
             locator.press_sequentially(text[start:start + _CHUNK_CHARS], delay=_jitter(PER_CHAR_MS))
     except PlaywrightError as e:
         logger.debug("Character-by-character typing failed (%s) — falling back to fill().", e)
-        locator.fill(text)
+        locator.fill(text, **fill_kwargs)
 
 
 def human_pause_between_fields(page: Page) -> None:

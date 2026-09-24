@@ -20,6 +20,37 @@ Status:
 ## Entries
 
 ```
+Failure ID: B-005
+Platform: generic (any custom "Add another employer/education entry" repeated field group cloned from one HTML template without re-indexing id/name)
+URL: local fixtures
+Field: (a) a required checkbox in row 2+ sharing a duplicate `id` with row 1's; (b) a native radio group in row 2+ sharing a duplicate `name` with row 1's
+Expected: filling row 2's field changes ONLY row 2's field and reports accurately
+Actual (a): CheckboxHandler's label-click fallback silently toggled row 1's checkbox (browser's `label[for=id]` click resolves via `getElementById`, always the FIRST match) while row 2 stayed unchecked — `fill()` returned success anyway since it never verified the click changed the INTENDED node.
+Actual (b): RadioHandler's `_native_radio_group` looked up `input[type=radio][name=X]` PAGE-GLOBALLY, merging both rows' groups into one; selecting row 2's "Yes" always resolved to row 1's "Yes" option, and `verify()` re-derives the SAME wrong group so it reported success while row 1 was silently mutated and row 2 was left untouched — the more severe of the two, since it corrupts a DIFFERENT question's answer while claiming the intended one succeeded.
+Failure Category: WRONG_CANDIDATE_MAPPING / CHECKBOX_FAILURE / RADIO_FAILURE (silent cross-field corruption, not a visible failure)
+Root Cause: (a) no per-attempt verification that a "successful" click actually changed field.locator's OWN state before returning — trusted click-didn't-throw as success. (b) group resolution scoped to the whole page rather than the nearest logical container, so two structurally-identical cloned rows sharing one `name` collapse into a single group.
+Existing Behavior: single global lookups in both handlers, no self-verification of intermediate attempts in CheckboxHandler.
+Fix: (a) CheckboxHandler now skips the label-click attempt entirely when `document.getElementById(el.id) !== el` (ambiguous duplicate id — the click can't reliably reach this node), and verifies `_safe_is_checked(field) == intent` after every subsequent click attempt before returning, falling through to the next strategy (ultimately the JS-only direct-node flip, which always targets the exact element regardless of duplicate ids) instead of returning on a click that didn't actually work. (b) `_native_radio_group` now first tries scoping to the nearest `fieldset`/`form`/`role=radiogroup`/`role=group` ancestor, using that scoped group only when it's smaller than the page-global set (i.e. genuine duplication detected) — strictly additive, falls through to the original page-global behavior for every normal single-group page.
+Files Changed: backend/automation/forms/field_handlers.py (CheckboxHandler.fill, _native_radio_group)
+Regression Test: backend/automation/tests/test_repeated_field_group_collisions.py (4 tests)
+Status: FIXED
+
+Failure ID: B-006
+Platform: generic (any location/address/city/employer-name style autocomplete backed by a real network-latency debounce — Google Places-shaped widgets are the common real case)
+URL: local fixture
+Field: City (role=combobox + aria-autocomplete=list, options mount ~1.5s after the debounced input event, matching a slow real API-backed lookup)
+Expected: fill_field() either selects the correct option once it loads, or reports failure — never a false "success" with nothing actually selected
+Actual: `_DropdownHandler.fill()`'s search-input path waited a single FIXED 300ms after typing, then searched once; when the option hadn't rendered yet, `fill()` gave up silently with no click at all, and `verify()`'s weakest fallback tier (raw leftover search-box text, reached because nothing else was inspectable yet) then matched the just-typed text against itself, reporting a completed fill that never actually selected anything.
+Failure Category: TIMING_FAILURE / AUTOCOMPLETE_FAILURE (false-positive verification, not a visible failure)
+Root Cause: a single fixed `wait_for_timeout(300)` assumed every searchable dropdown filters near-instantly/locally; a real network-backed lookup routinely exceeds that, and the fixed-sleep design had no way to keep waiting once it had already given up on that one attempt.
+Existing Behavior: sleep once, search once, give up.
+Fix: replaced the single sleep+search with a bounded poll (6 rounds x 300ms wait, ~1.8s total) that re-searches for the matching option after each round and stops as soon as one appears — a genuinely-no-match case still fails within the same bound, just not falsely-instantly. `verify()`'s existing false-positive guard (`_has_inspectable_options`) is untouched; this fixes the ROOT timing gap instead.
+Files Changed: backend/automation/forms/field_handlers.py (`_DropdownHandler.fill`)
+Regression Test: backend/automation/tests/test_async_autocomplete_options.py (2 tests, asserting the widget's OWN "was an option actually clicked" signal, not just fill_field's report)
+Status: FIXED
+```
+
+```
 Failure ID: B-001
 Platform: generic (any ATS using <input type="month"> — common for "expected graduation" / cert expiry)
 URL: local fixture
@@ -153,3 +184,21 @@ Fix: `capture_page_signature` gained an optional `controls_root: Page | Frame | 
 Files Changed: automation/applications/page_navigator.py, automation/applications/application_flow_manager.py
 Regression Test: automation/tests/test_iframe_signature_scoping.py (6 tests)
 Status: FIXED — verified via git-stash A/B comparison that `test_application_flow_manager.py`'s 36 pre-existing fixture-collision errors are byte-identical with and without this change (46 passed / 36 errors both ways); zero regression.
+
+---
+Failure ID: A-006
+Platform: generic (any field whose locator was resolved by `describe_field()` and then becomes permanently unresolvable before `fill_field()` runs — e.g. a react-select-style remount regenerating a generated id)
+URL: n/a (unit-level; empirically measured: 3 minimal repro tests took 334.67s real-time before this fix — background run, this session)
+Field: any `<input>`/`<textarea>` handled by TextInputHandler/TextAreaHandler
+Expected: a permanently-dead locator is reported as a failure within a bounded, reasonable time; the failure reason distinguishes "never reached" from "reached but rejected the value"
+Actual: `Locator.fill()`/`.input_value()`/`.evaluate()` (the debug-snapshot read) all used Playwright's unbounded 30s default timeout with no explicit override. `fill_field`'s 3-attempt retry loop calls fill+verify per attempt, so ONE permanently-unreachable field could cost up to ~3 minutes before reporting failure — and the retry loop's own redundancy was defeated, since one attempt already exhausted nearly the same wall-clock budget three would. The failure was also reported as generic "verification_failed", indistinguishable in logs/review from a field that WAS reached but rejected the typed value.
+Failure Category: LOCATOR_FAILURE / TIMING_FAILURE
+Root Cause: no explicit `timeout` param on `TextInputHandler`/`TextAreaHandler`'s `fill()`/`verify()` calls, nor on `_capture_element_html`'s diagnostic `evaluate()` (used on every failure path).
+Existing Behavior: n/a
+Fix: `human_type()` gained an optional `timeout_ms` param (`None` = unchanged default for every other caller); `TextInputHandler`/`TextAreaHandler` now pass `_TEXT_INPUT_ACTION_TIMEOUT_MS=5000`; `_capture_element_html` bounded to `_ELEMENT_HTML_SNAPSHOT_TIMEOUT_MS=2000`. Separately, `fill_field` now tracks whether EVERY `fill()` attempt raised (the locator was never once actually interacted with) and reports `failure_reason="element_unreachable"` instead of `"verification_failed"` for that specific case — a pure diagnostics change, verified it does NOT reclassify the existing "fill always succeeds, value never sticks" scenario (that stays `"verification_failed"`, confirmed via existing pinned tests in test_field_handlers.py).
+Known follow-up (NOT fixed here, logged for a future dedicated pass): `FieldHandlerRegistry.get_handler()`'s own handler-DETECTION phase has the SAME root cause in several handlers' `supports()` methods — `ReactSelectHandler`/`ComboboxHandler` (at minimum) call `locator.get_attribute(...)` with no explicit timeout, and EVERY field's `fill_field()` call probes ALL registered handlers' `supports()` regardless of which one ultimately matches (no early exit — by design, to detect ambiguity). This means a permanently-dead locator can still be slow to even REACH the retry loop this fix bounds. Confirmed present via direct code reading; not swept in this change to keep the change reviewable and because bounding ~12 handlers' `supports()` consistently deserves its own careful audit+test pass rather than a rushed sweep alongside this fix.
+Files Changed: automation/forms/field_handlers.py, automation/utils/human_input.py
+Regression Test: automation/tests/test_element_unreachable_classification.py (3 tests; confirms both the classification AND the latency fix — 35.5s for all 3 after the fix, vs 334.67s before)
+Status: FIXED (fill/verify phase); handler-detection phase logged as a known follow-up, not yet fixed.
+
+Addendum to A-006: the first version of this fix always passed `timeout=timeout_ms` to `Locator.fill()`, including `timeout=None` for every OTHER caller of `human_type()` (e.g. `automation/agents/autonomous/executor.py::_do_fill`, which calls it with no `timeout_ms`). That broke every test double implementing only Playwright's real `fill(value)` signature (no `timeout` kwarg at all) — caught by the full-suite regression run BEFORE commit (5 new failures: test_autonomous_executor.py x3, test_malicious_decision_rejection.py, test_secret_leakage_audit.py). Fixed by omitting the `timeout` kwarg entirely when `timeout_ms is None` (`**({"timeout": timeout_ms} if timeout_ms is not None else {})`) rather than passing it as `None`. Re-verified: all 5 pass, batch of 11 related files (233 tests) shows the same pre-existing failure/error set as before this fix and no new ones.
