@@ -279,8 +279,36 @@ def looks_like_opt_in_label(text: str) -> bool:
     return any(pattern.search(text) for pattern in _OPT_IN_LABEL_PATTERNS)
 
 
+#: Above this, `label`/`placeholder`/`nearby_text` is treated as a full
+#: screening-QUESTION SENTENCE, not a short field caption, and is refused
+#: here regardless of what synonym it happens to contain — see
+#: `_first_matching_attribute`'s docstring. Every real short-caption label in
+#: this codebase's own test fixtures is well under 20 characters even at its
+#: most verbose ("Telephone Number", "LinkedIn Profile*"); 60 leaves generous
+#: room for a wordier-than-usual caption while still excluding an actual
+#: sentence, which is reliably 100+ characters.
+_MAX_SHORT_LABEL_CHARS = 60
+
+
 def _first_matching_attribute(normalized: str) -> str | None:
-    if not normalized:
+    """Matches a SHORT field caption (a `<label>`, a placeholder, recovered
+    nearby text) against `FIELD_SYNONYMS`. Deliberately refuses anything
+    longer than `_MAX_SHORT_LABEL_CHARS`: a real Greenhouse-style custom
+    question renders its `<label>` as the FULL QUESTION SENTENCE wrapping the
+    control, and a bare, common-English-word synonym like "country" then
+    matches it as a plain substring even though the question is asking
+    something else entirely — observed live: "Will you now or in the future
+    require employment visa sponsorship to work in the COUNTRY in which the
+    job you're applying for is located?" resolved to `("country", 0.9)`, so
+    the sponsorship dropdown was filled with the candidate's own country
+    ("India +91") instead of an answer to the actual question. A
+    sentence-shaped signal is exactly what `question_classifier.py` exists to
+    classify instead (see that module's docstring on the two-layer split) —
+    refusing here, rather than guessing, is what lets `ats/base.py`'s caller
+    correctly fall through to that path (`_collect_for_answer_engine` ->
+    `ApplicationAnswerEngine`), which already classifies this exact sentence
+    as `requires_sponsorship` and answers it correctly."""
+    if not normalized or len(normalized) > _MAX_SHORT_LABEL_CHARS:
         return None
     for attribute, synonyms in FIELD_SYNONYMS.items():
         if _matches_synonym(normalized, synonyms):

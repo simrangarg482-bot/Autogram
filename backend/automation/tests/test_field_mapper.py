@@ -148,3 +148,30 @@ def test_cell_phone_and_cell_number_match_phone():
 
 def test_forename_matches_first_name():
     assert FieldMapper.map_field(label="Forename") == ("first_name", LABEL_MATCH_CONFIDENCE)
+
+
+# ---------- long sentence-shaped labels must not match a bare-word synonym (A-007) ----------
+
+def test_a_long_screening_question_containing_a_bare_synonym_word_is_not_matched():
+    """Observed live: a Greenhouse-style custom Yes/No sponsorship question's
+    <label> IS the full question sentence, and it merely mentions "country" in
+    passing — this must fall through to the answer-engine path
+    (question_classifier.py correctly classifies it as requires_sponsorship),
+    never resolve to FieldMapper's short "country" caption match, which would
+    fill the dropdown with the candidate's own country instead of Yes/No."""
+    question = (
+        "Will you now or in the future require employment visa sponsorship to work in "
+        "the country in which the job you're applying for is located?"
+    )
+    assert FieldMapper.map_field(label=question) is None
+    assert FieldMapper.map_field(nearby_text=question) is None
+
+
+def test_a_genuinely_short_country_label_still_matches():
+    assert FieldMapper.map_field(label="Country") == ("country", LABEL_MATCH_CONFIDENCE)
+
+
+def test_the_name_id_tier_is_not_length_limited():
+    """Backend field identifiers are a different, inherently-short signal —
+    the length guard only applies to prose (label/placeholder/nearby_text)."""
+    assert FieldMapper.map_field(name="applicant_country_of_residence") == ("country", NAME_MATCH_CONFIDENCE)
