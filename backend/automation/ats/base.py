@@ -485,21 +485,42 @@ class ATSAdapter(ABC):
     def _find_resume_input(self) -> Locator | None:
         """The page's résumé file input, revealing it first if this ATS keeps
         it behind an "Attach"/"Upload" trigger. `None` when this page has no
-        upload field at all (a later step of a multi-step form, a posting that
+        upload field at all (a later step of a multi-page form, a posting that
         doesn't ask for a résumé)."""
         upload_input = find_file_upload_input(self.form_root)
         if upload_input is not None:
             return upload_input
 
         trigger = find_upload_trigger_button(self.form_root)
-        if trigger is None:
-            return None
-        try:
-            trigger.click()
-        except PlaywrightError as e:
-            logger.debug("%s: clicking the upload trigger failed (%s).", self.name, e)
-            return None
-        return find_file_upload_input(self.form_root)
+        if trigger is not None:
+            try:
+                trigger.click()
+            except PlaywrightError as e:
+                logger.debug("%s: clicking the upload trigger failed (%s).", self.name, e)
+            else:
+                upload_input = find_file_upload_input(self.form_root)
+                if upload_input is not None:
+                    return upload_input
+
+        # A third-party résumé-upload widget (Filestack/Uploadcare-style
+        # embed) is commonly its OWN <iframe>, separate from whichever frame
+        # `resolve_form_root` picked for the rest of the form — that widget
+        # frame has only ~1 control (the file input itself), so it can never
+        # win `resolve_form_root`'s control-count comparison and `form_root`
+        # never points at it. Confirmed live-reproducible with a local
+        # fixture: a form iframe with 5 ordinary fields plus a SEPARATE
+        # iframe containing only `<input type=file>` — the file input was
+        # never found at all, on every attempt, regardless of trigger text.
+        for frame in self.page.frames:
+            if frame is self.form_root:
+                continue
+            try:
+                upload_input = find_file_upload_input(frame)
+            except PlaywrightError:
+                continue
+            if upload_input is not None:
+                return upload_input
+        return None
 
     #: Is a résumé visibly attached, as the FORM sees it? Checks the input's
     #: own `files` first, then — for ATS UIs that upload to S3 and clear the

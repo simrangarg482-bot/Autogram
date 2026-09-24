@@ -14,3 +14,7 @@ Baseline (2026-09-24, before this session's changes): `pytest automation/tests -
   → 25 failed, 1663 passed, 156 skipped, 582 errors.
   Failed set is BYTE-IDENTICAL to the documented pre-existing clean-HEAD baseline (test_autonomous_loop.py FakeBrowserManager fixture gaps + test_chat_and_event_bus.py — unrelated to any field-handling change). Zero regressions.
   Error count (582 vs earlier-session baseline ~544-567) continues to track the known local Playwright `page`-fixture collision in full-suite runs (files pass individually/in small batches — see test_option_ranking.py/test_date_coercion.py/test_radio_option_ranking.py/test_field_mapper.py all green in isolation, 300+ passed across targeted batches this session).
+
+- 2026-09-24 Session B, after B-004 (résumé-upload-widget-in-separate-iframe fix, automation/ats/base.py):
+  `pytest test_generic_adapter.py test_greenhouse_adapter.py test_lever_adapter.py test_workday_adapter.py test_resume_reattach.py test_resume_upload_separate_iframe.py -q`
+  → 89 passed, 0 failed. Also manually verified nested (iframe-in-iframe) form discovery already works correctly (no fix needed — `page.frames` is flat regardless of nesting depth).

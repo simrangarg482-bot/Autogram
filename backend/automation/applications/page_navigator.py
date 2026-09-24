@@ -43,7 +43,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field as _dc_field
 
-from playwright.sync_api import Error as PlaywrightError, Locator, Page
+from playwright.sync_api import Error as PlaywrightError, Frame, Locator, Page
 
 from automation.browser.selectors import (
     dismiss_overlays,
@@ -183,22 +183,35 @@ class NavigationOutcome:
     click_failed: bool = False
 
 
-def visible_control_identities(page: Page) -> tuple[str, ...]:
-    """Identities of every visible form control, in DOM order. `()` if the page
-    can't currently be read — a detached/navigating document is a transient
-    state, not an error worth propagating."""
+def visible_control_identities(root: Page | Frame) -> tuple[str, ...]:
+    """Identities of every visible form control, in DOM order, scanned against
+    `root` — a `Page` or a `Frame` (both expose `.evaluate`). `()` if it can't
+    currently be read — a detached/navigating document is a transient state,
+    not an error worth propagating."""
     try:
-        identities = page.evaluate(_CONTROL_IDENTITIES_JS)
+        identities = root.evaluate(_CONTROL_IDENTITIES_JS)
     except PlaywrightError as e:
         logger.debug("Could not read control identities (%s) — treating as none.", e)
         return ()
     return tuple(str(item) for item in (identities or []))
 
 
-def capture_page_signature(page: Page) -> PageSignature:
+def capture_page_signature(page: Page, *, controls_root: Page | Frame | None = None) -> PageSignature:
     """A snapshot of which page is currently on screen. Every component is
     best-effort: a page mid-navigation yields a partial signature rather than
-    raising, and a partial signature still compares correctly."""
+    raising, and a partial signature still compares correctly.
+
+    `controls_root` (defaults to `page`) is where the CONTROLS half of the
+    signature is scanned from — `url`/`title`/`heading`/`step_indicator` always
+    come from the real top-level `page`, since those are genuinely page-level
+    facts even for a platform that renders its FORM inside a same-origin
+    content iframe (iCIMS, confirmed live — see
+    `automation.browser.selectors.resolve_form_root`). Pass the adapter's
+    `form_root` here when checking whether a page revealed new fields
+    (conditional follow-up questions): scanning `page` for that on an
+    iframe-rendered form always reads zero/unchanged controls, since none of
+    them are ever visible from the top-level document — not because nothing
+    changed, but because nothing there was ever being looked at."""
     try:
         url = page.url or ""
     except PlaywrightError:
@@ -212,7 +225,7 @@ def capture_page_signature(page: Page) -> PageSignature:
         title=title,
         heading=find_page_heading(page),
         step_indicator=find_step_indicator(page),
-        controls=visible_control_identities(page),
+        controls=visible_control_identities(controls_root if controls_root is not None else page),
     )
 
 

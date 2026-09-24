@@ -1116,7 +1116,20 @@ class ApplicationFlowManager:
         # `page_number` — see `ApplicationAnswerEngine.current_page_number`.
         if self.answer_engine is not None:
             self.answer_engine.current_page_number = page_index + 1
-        signature = capture_page_signature(page)
+        # `controls_root`, not `page`: on an iframe-rendered ATS form (iCIMS,
+        # confirmed live — see `resolve_form_root`), `page` never has any
+        # visible controls at all, so comparing plain `page`-scoped signatures
+        # here would never detect a conditional field revealing itself —
+        # every round would read as "revealed nothing" and the loop would
+        # silently stop after round 0, leaving follow-up questions unfilled
+        # with no indication why. Scoped to THIS loop's own before/after
+        # comparison only — the signature this method ultimately RETURNS is
+        # recomputed page-level below, since that value is later used as the
+        # `before` signature for click/navigation detection, which must stay
+        # `page`-scoped (comparing it against a plain `page`-scoped `after`
+        # elsewhere) or every page-turn would misread as "advanced".
+        controls_root = adapter.form_root
+        signature = capture_page_signature(page, controls_root=controls_root)
 
         for round_index in range(self.MAX_FILL_ROUNDS):
             results: list[FieldFillResult] = []
@@ -1134,7 +1147,7 @@ class ApplicationFlowManager:
                     "filled" if r.filled else "NOT filled", r.profile_path or r.field_key,
                 )
 
-            after = capture_page_signature(page)
+            after = capture_page_signature(page, controls_root=controls_root)
             revealed = after.newly_visible_controls(signature)
             signature = after
             if not revealed:
@@ -1152,7 +1165,13 @@ class ApplicationFlowManager:
             )
 
         self.checkpoint(f"step_{page_index}_filled")
-        return signature
+        # Plain `page`-scoped, deliberately NOT `signature` (which may carry
+        # `form_root`-scoped controls from the loop above) — this return value
+        # becomes the `before` signature `_advance_to_next_page` compares
+        # against a plain `page`-scoped `after`; mixing scopes there would
+        # make `.controls` differ on every comparison regardless of whether
+        # navigation actually happened.
+        return capture_page_signature(page)
 
     def _upload_resume_if_offered(
         self, adapter: ATSAdapter, page_index: int, all_results: list[FieldFillResult],

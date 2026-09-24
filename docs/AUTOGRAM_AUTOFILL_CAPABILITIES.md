@@ -14,7 +14,11 @@
 | Date fields — native `<input type=date>` | YES | YES | HIGH | DateHandler + _coerce_date_string |
 | Date fields — native `<input type=month>` | YES | YES | HIGH | DateHandler + _coerce_month_string (Sept 2026 fix — previously no_handler_matched 100% of the time, see B-001) |
 | Date fields — text-input calendar-popup style (react-datepicker/MUI/AntD) | PARTIAL | PARTIAL | UNKNOWN | Falls through to TextInputHandler; value fills correctly and doesn't block the NEXT field (test_datepicker_popup_overlay.py), but no click-to-select-a-day / no explicit popup dismissal — untested against a click-based handler running right after a leftover overlay |
-| File upload | YES | PARTIAL | MEDIUM | needs investigation |
-| iframe forms | PARTIAL | PARTIAL | UNKNOWN | resolve_form_root compares control counts; needs investigation |
+| File upload — same-frame / trigger-revealed input | YES | YES | HIGH | ATSAdapter._find_resume_input |
+| File upload — widget in a SEPARATE iframe from the main form | YES | YES | HIGH | Sept 2026 fix (B-004) — cross-frame fallback in _find_resume_input |
+| iframe forms — single form iframe vs. top-level | YES | YES | HIGH | resolve_form_root compares control counts |
+| iframe forms — nested (iframe-in-iframe) | YES | YES | HIGH | page.frames is flat regardless of nesting depth; resolve_form_root already scans it correctly (verified — no bug found) |
+| iframe forms — form iframe with an OTHER, low-control-count widget iframe alongside it (e.g. résumé upload) | YES | YES | HIGH | Sept 2026 fix (B-004) |
+| Cover-letter upload widget in a SEPARATE iframe from the résumé/main form | NO | NO | UNKNOWN | `find_cover_letter_upload_input` only searches `form_root` and only distinguishes resume-vs-cover-letter when BOTH file inputs are on the same root (needs ≥2 file inputs there to disambiguate) — same class of bug as B-004 but not yet fixed; lower real-world frequency (two separate third-party upload widgets on one posting is rare) so left as a documented gap rather than spec-fixed without a concrete repro |
 | Shadow DOM | UNKNOWN | NO | UNKNOWN | needs investigation |
 | Multi-step forms | YES | PARTIAL | MEDIUM | application_flow_manager.py |

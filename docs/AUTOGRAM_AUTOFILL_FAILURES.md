@@ -61,6 +61,20 @@ Fix: none needed. This closes a real coverage gap — previously this pattern wa
 Files Changed: none
 Regression Test: backend/automation/tests/test_conditional_other_reveal.py, backend/automation/tests/test_checkbox_group_other_reveal.py
 Status: NO BUG FOUND (documented for coverage)
+
+Failure ID: B-004
+Platform: generic (any career site embedding a third-party résumé-upload widget — e.g. Filestack/Uploadcare-style — in its own iframe, separate from the main application form's iframe/page)
+URL: local fixture
+Field: résumé file input, rendered inside iframe #2 while the rest of the form (5 fields) is inside iframe #1
+Expected: adapter.upload_resume() finds and fills the file input regardless of which frame it lives in
+Actual: upload_resume() -> False, résumé never found or uploaded, 100% of the time on this shape
+Failure Category: FILE_UPLOAD_FAILURE / IFRAME_FAILURE
+Root Cause: `resolve_form_root` correctly picks the frame with the MOST form controls for the rest of the form (by design, to avoid an incidental chat-widget iframe winning) — but an upload-widget iframe genuinely has only ~1 control (the file input itself), so it can never win that comparison. `ATSAdapter._find_resume_input` (automation/ats/base.py) only ever searched `self.form_root` — first directly, then again after clicking an upload-trigger button found on that SAME root — never any other frame on the page.
+Existing Behavior: single-root search, trigger-click fallback still scoped to the same root.
+Fix: after form_root (and its trigger) both come up empty, `_find_resume_input` now falls back to scanning every OTHER frame on `self.page` directly for a bare file input. No change to `resolve_form_root` or any Session-A-owned file — the fix is entirely in `automation/ats/base.py`, which no one had claimed.
+Files Changed: backend/automation/ats/base.py
+Regression Test: backend/automation/tests/test_resume_upload_separate_iframe.py
+Status: FIXED
 ```
 
 ---
@@ -124,3 +138,18 @@ Regression Test: automation/tests/test_option_ranking.py::test_virtualized_listb
 Status: FIXED
 
 Audit note: every remaining `_values_match` call site in field_handlers.py was checked — the rest are either (a) comparator functions (`_matches`) passed INTO the now-fixed `_find_matching_option`/`_search_with_scrolling`, so already covered, or (b) `NativeSelectHandler._resolve_one`, which already does full tiered exact-before-loose matching AND refuses on ambiguity (the best-designed matcher in the file — `option_matching.py::match_option`, used by the answer-engine/LLM path, is equally solid). The gap was specifically in the four `_DropdownHandler`/`RadioHandler`/`VirtualizedListboxHandler` loops that bypassed tiering entirely; all four are now fixed (A-001, A-004, + RadioHandler fix logged in mission doc).
+
+---
+Failure ID: A-005
+Platform: generic (any ATS that renders its form inside a same-origin iframe — iCIMS confirmed live)
+URL: n/a (unit-level; same class as the already-fixed `_still_missing_required` iframe blind spot)
+Field: any conditional/follow-up field revealed after an earlier answer, on an iframe-rendered form
+Expected: `ApplicationFlowManager._fill_page`'s round loop detects the new field and fills it (same as it already does for a top-level-rendered form)
+Actual: the loop always read "revealed nothing" and silently stopped after round 0 — conditional follow-up fields on iframe-rendered ATS forms were never filled, with nothing in the log indicating why
+Failure Category: DYNAMIC_FIELD_FAILURE / IFRAME_FAILURE
+Root Cause: `capture_page_signature(page)` scans `.controls` from the top-level `page` only (`visible_control_identities` calls `page.evaluate(...)`, never a `Frame`). `_fill_page`'s before/after comparison for `newly_visible_controls()` always used this page-scoped signature, so on an iframe-rendered form both `before` and `after` always read `.controls == ()` — never differing, so `revealed` was always empty, indistinguishable from "genuinely nothing changed." The exact same root cause (`resolve_form_root` existing specifically because scanning `page` on an iframe-rendered form finds nothing) had already been fixed once for `_still_missing_required` (see that call site's comment in application_flow_manager.py) but was never applied to this second, independent call site.
+Existing Behavior: `capture_page_signature(page)` — `.controls` always top-level-page-scoped, no parameter to change that.
+Fix: `capture_page_signature` gained an optional `controls_root: Page | Frame | None` param (default `page` — every other call site unaffected). `_fill_page` now captures its round-loop before/after pair with `controls_root=adapter.form_root`. Critically, the value `_fill_page` RETURNS (used downstream as the `before` signature for `_advance_to_next_page`'s click/navigation detection) is recomputed as a plain page-scoped signature right before returning — mixing scopes there would make `.controls` differ on every comparison regardless of real navigation, a false-positive "page advanced" on every page-turn for an iframe-rendered form. Verified this specific risk is avoided (see test_a_page_scoped_before_against_an_iframe_scoped_after_would_have_false_positived, which documents the exact failure mode being guarded against).
+Files Changed: automation/applications/page_navigator.py, automation/applications/application_flow_manager.py
+Regression Test: automation/tests/test_iframe_signature_scoping.py (6 tests)
+Status: FIXED — verified via git-stash A/B comparison that `test_application_flow_manager.py`'s 36 pre-existing fixture-collision errors are byte-identical with and without this change (46 passed / 36 errors both ways); zero regression.
