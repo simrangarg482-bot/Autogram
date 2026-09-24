@@ -281,6 +281,18 @@ def _coerce_date_string(value) -> str:
     text = str(value).strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
         return text
+    # Education/experience `start_date`/`end_date` are stored free-form and are
+    # documented (see `app/models/db_models.py`) as often just "2018" or
+    # "2018-08" — a résumé rarely gives a day. A native `<input type=date>`
+    # requires a full YYYY-MM-DD or silently rejects the value (`fill()`
+    # neither raises nor sets anything), so this used to leave a start/end
+    # date field empty on every real ATS whenever the profile only had a
+    # year or year-month. Defaulted to the 1st of the month/year — the day is
+    # never asked about separately, so nothing more specific is lost.
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return f"{text}-01"
+    if re.fullmatch(r"\d{4}", text):
+        return f"{text}-01-01"
     for fmt in ("%m/%d/%Y", "%d/%m/%Y", "%B %d, %Y", "%b %d, %Y", "%Y/%m/%d"):
         try:
             return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
@@ -416,23 +428,60 @@ class TextInputHandler(FieldHandler):
         return _values_match(value, actual), actual
 
 
+def _coerce_month_string(value) -> str:
+    """Best-effort normalization to `<input type=month>`'s required
+    `YYYY-MM` — this control has no day segment at all, so a full
+    `YYYY-MM-DD` (which `_coerce_date_string` happily produces) is simply
+    invalid for it and `fill()` silently rejects it, same failure mode
+    `_coerce_date_string` documents for the day-less case."""
+    text = str(value).strip()
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text[:7]
+    if re.fullmatch(r"\d{4}", text):
+        return f"{text}-01"
+    for fmt in ("%m/%Y", "%B %Y", "%b %Y", "%Y/%m"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m")
+        except ValueError:
+            continue
+    coerced = _coerce_date_string(text)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", coerced):
+        return coerced[:7]
+    return text
+
+
 class DateHandler(FieldHandler):
+    """Native `<input type=date>` and `<input type=month>` — the latter is
+    the common real-world shape for "expected graduation" / certification
+    expiry questions and previously had NO handler at all (`month` is not a
+    plain fillable text type, so `TextInputHandler` doesn't claim it either),
+    which meant these fields failed with `no_handler_matched` on every single
+    application that used one, 100% of the time."""
+
     def supports(self, field: Field) -> bool:
-        return field.tag_name == "input" and field.input_type == "date"
+        return field.tag_name == "input" and field.input_type in ("date", "month")
+
+    def _coerced(self, field: Field, value) -> str:
+        if field.input_type == "month":
+            return _coerce_month_string(value)
+        return _coerce_date_string(value)
 
     def fill(self, field: Field, value) -> None:
-        # Deliberately NOT human-typed. `input[type=date]` renders as segmented
-        # day/month/year spinners whose keystroke handling follows the BROWSER
-        # LOCALE, so typing "1990-05-14" character by character lands the parts
-        # in a different order per locale, and Escape/Tab between segments
-        # varies too. `fill()` sets the ISO value the element actually stores,
-        # which is unambiguous — and a date picker has no as-you-type filtering
-        # behaviour that per-character input would buy us anyway.
-        field.locator.fill(_coerce_date_string(value))
+        # Deliberately NOT human-typed. `input[type=date/month]` renders as
+        # segmented day/month/year spinners whose keystroke handling follows
+        # the BROWSER LOCALE, so typing "1990-05-14" character by character
+        # lands the parts in a different order per locale, and Escape/Tab
+        # between segments varies too. `fill()` sets the ISO value the
+        # element actually stores, which is unambiguous — and a date picker
+        # has no as-you-type filtering behaviour that per-character input
+        # would buy us anyway.
+        field.locator.fill(self._coerced(field, value))
 
     def verify(self, field: Field, value) -> tuple[bool, str | None]:
         actual = field.locator.input_value()
-        return actual == _coerce_date_string(value), actual
+        return actual == self._coerced(field, value), actual
 
 
 _CHECKBOX_NEGATIVE_TEXT = {"no", "n", "false", "0", "off", "unchecked", "disagree", "decline"}
@@ -903,17 +952,26 @@ class RadioHandler(FieldHandler):
         return _button_choice_group(field)
 
     def _matching_option(self, field: Field, value) -> Locator | None:
+        # Exact match wins over a merely-containing one, same reasoning and
+        # same fix as `_find_matching_option` — a radio group with "Yes" AND
+        # "Yes, with restrictions" has this exact ambiguity, and DOM order
+        # alone used to decide which one got checked.
         group = self._group(field)
         try:
             count = group.count()
         except PlaywrightError:
             count = 0
+        fallback: Locator | None = None
         for i in range(count):
             option = group.nth(i)
             text = _option_text(field.page, option)
-            if text and _values_match(value, text):
+            if not text or not _values_match(value, text):
+                continue
+            if _normalize_for_compare(text) == _normalize_for_compare(str(value)):
                 return option
-        return None
+            if fallback is None:
+                fallback = option
+        return fallback
 
     def _is_selected(self, option: Locator) -> bool:
         # Audit fix: short explicit timeout — see CheckboxHandler._safe_is_checked.
@@ -1348,17 +1406,34 @@ def _find_matching_option(page: Page, value, matches: Callable[[str, object], bo
     """Searches every open option container, not just the first one found —
     see `_option_containers`. Falls back to scanning `body` when no container
     resolves at all, which is the original behavior and is safe here because
-    this is looking for ONE known string rather than enumerating choices."""
+    this is looking for ONE known string rather than enumerating choices.
+
+    Two passes, exact before loose. `matches` (e.g. `_values_match`) accepts
+    containment in EITHER direction, which is deliberately generous for widgets
+    that reformat what you typed — but on a real form it also means two options
+    where one's text contains the other's ("India +91" / "British Indian Ocean
+    Territory +246" both contain "India") both satisfy `matches`, and whichever
+    happens to render first wins, regardless of which one is actually right.
+    An exact (normalized) match is strictly better evidence than a containment
+    match, so it is tried across every option FIRST; only when nothing matches
+    exactly does this fall back to the original first-loose-match behavior —
+    which is unchanged for every case that had no exact match available, and
+    for every case where DOM order already put the exact match first."""
     scopes = _option_containers(page) or [page.locator("body")]
+    fallback: Locator | None = None
     for scope in scopes:
         for option in _iter_visible_options(scope):
             try:
                 text = (option.text_content() or "").strip()
             except PlaywrightError:
                 continue
-            if text and matches(text, value):
+            if not text or not matches(text, value):
+                continue
+            if _normalize_for_compare(text) == _normalize_for_compare(str(value)):
                 return option
-    return None
+            if fallback is None:
+                fallback = option
+    return fallback
 
 
 def _search_with_scrolling(
@@ -1874,14 +1949,24 @@ class VirtualizedListboxHandler(FieldHandler):
             return False
 
     def _find_option(self, field: Field, value) -> Locator | None:
+        # Exact match wins over a merely-containing one — same fix as
+        # `_find_matching_option`/`RadioHandler._matching_option`, and the
+        # widget shape it matters MOST for: a long virtualized country/
+        # university/location list is exactly where two entries share a
+        # substring ("India" / "British Indian Ocean Territory").
+        fallback: Locator | None = None
         for option in _iter_visible_options(field.locator):
             try:
                 text = (option.text_content() or "").strip()
             except PlaywrightError:
                 continue
-            if text and _values_match(value, text):
+            if not text or not _values_match(value, text):
+                continue
+            if _normalize_for_compare(text) == _normalize_for_compare(str(value)):
                 return option
-        return None
+            if fallback is None:
+                fallback = option
+        return fallback
 
     def fill(self, field: Field, value) -> None:
         option = self._find_option(field, value) or scroll_container_until_option_found(

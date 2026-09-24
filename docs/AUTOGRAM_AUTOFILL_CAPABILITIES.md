@@ -1,0 +1,20 @@
+# AUTOGRAM Autofill — Capability Matrix
+
+| Capability | Supported | Tested | Reliability | Notes |
+|---|---|---|---|---|
+| Text input (label/aria/placeholder) | YES | YES | HIGH | field_mapper.py + describe_field; phone/first_name synonym gaps closed (telephone, cell phone/number, forename — A-003) |
+| Native select | YES | YES | HIGH | NativeSelectHandler |
+| react-select combobox | YES | YES | MEDIUM | ComboboxHandler; option-order ambiguity fixed for country, generalizable bug remains for other confusable-option dropdowns (see failures log) |
+| Country picker (name+dial code) | YES | YES | HIGH | CountryPickerHandler + country_dial_codes.py (Sept 2026 fix) |
+| Radio groups | YES | YES | HIGH | RadioHandler |
+| Checkbox / checkbox groups | YES | YES | HIGH | CheckboxHandler |
+| Autonomous agent select() on custom dropdown | YES | YES | MEDIUM | executor.py _select_custom_option (opens+clicks role=option, was calling select_option() before fix) |
+| Demographics (gender/disability/veteran/race/hispanic) | YES | YES | HIGH | answer_engine.py, never LLM-answered, saved via Application Profile UI |
+| DB session resilience across long browser runs | YES | YES | HIGH | answer_engine.py session_factory + _run_db retry-once |
+| Date fields — native `<input type=date>` | YES | YES | HIGH | DateHandler + _coerce_date_string |
+| Date fields — native `<input type=month>` | YES | YES | HIGH | DateHandler + _coerce_month_string (Sept 2026 fix — previously no_handler_matched 100% of the time, see B-001) |
+| Date fields — text-input calendar-popup style (react-datepicker/MUI/AntD) | PARTIAL | PARTIAL | UNKNOWN | Falls through to TextInputHandler; value fills correctly and doesn't block the NEXT field (test_datepicker_popup_overlay.py), but no click-to-select-a-day / no explicit popup dismissal — untested against a click-based handler running right after a leftover overlay |
+| File upload | YES | PARTIAL | MEDIUM | needs investigation |
+| iframe forms | PARTIAL | PARTIAL | UNKNOWN | resolve_form_root compares control counts; needs investigation |
+| Shadow DOM | UNKNOWN | NO | UNKNOWN | needs investigation |
+| Multi-step forms | YES | PARTIAL | MEDIUM | application_flow_manager.py |

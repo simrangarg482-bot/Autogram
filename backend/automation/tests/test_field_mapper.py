@@ -128,3 +128,23 @@ def test_matches_city_state_country_and_address():
 def test_matches_website_url_distinctly_from_portfolio_url():
     assert FieldMapper.map_field(label="Personal Website") == ("portfolio_url", LABEL_MATCH_CONFIDENCE)
     assert FieldMapper.map_field(label="Website URL") == ("website_url", LABEL_MATCH_CONFIDENCE)
+
+
+# ---------- phone/first-name synonym gaps (Failure A-003) ----------
+# `question_ontology.classify_field` (the autonomous-agent path) already
+# generalized these labels (see test_field_label_generalization.py); this
+# deterministic FieldMapper table — used by the ATS-adapter path
+# (Greenhouse/Lever/etc via ats/base.py) — had silently drifted behind it.
+
+def test_telephone_matches_phone():
+    assert FieldMapper.map_field(label="Telephone") == ("phone", LABEL_MATCH_CONFIDENCE)
+    assert FieldMapper.map_field(label="Telephone Number") == ("phone", LABEL_MATCH_CONFIDENCE)
+
+
+def test_cell_phone_and_cell_number_match_phone():
+    assert FieldMapper.map_field(label="Cell Phone") == ("phone", LABEL_MATCH_CONFIDENCE)
+    assert FieldMapper.map_field(label="Cell Number") == ("phone", LABEL_MATCH_CONFIDENCE)
+
+
+def test_forename_matches_first_name():
+    assert FieldMapper.map_field(label="Forename") == ("first_name", LABEL_MATCH_CONFIDENCE)

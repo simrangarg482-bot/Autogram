@@ -52,14 +52,24 @@ FIELD_SYNONYMS: dict[str, list[str]] = {
     # goes unfilled. `format_preferred_name` already falls back to `first_name`
     # when nothing is stored, so nothing is lost by claiming it here.
     "preferred_name": ["preferred name", "preferred first name", "nickname", "name you go by"],
-    "first_name": ["first name", "given name", "legal first name"],
+    # "forename" — the UK/formal-register term for first name (govt./legacy
+    # ATS forms use it where a US-style form says "first name"/"given name").
+    "first_name": ["first name", "given name", "legal first name", "forename"],
     # No "middle initial": that field wants one letter, and typing a whole
     # middle name into it is a wrong answer where a blank is a harmless one.
     "middle_name": ["middle name", "legal middle name"],
     "last_name": ["last name", "surname", "family name", "legal last name"],
     "full_name": ["full name", "candidate name", "your name"],
     "email": ["email", "email address", "e-mail"],
-    "phone": ["phone", "phone number", "mobile", "contact number"],
+    # "telephone" is its own word, not "phone" is missing a word boundary before it —
+    # "telephone" does NOT contain "phone" on a word boundary ("tele" runs straight
+    # into it), so `\bphone\b` never matched "Telephone"/"Telephone Number" at all.
+    # "cell"/"cell phone"/"cell number" is the other common US-forms phrasing this
+    # table had no entry for whatsoever.
+    "phone": [
+        "phone", "phone number", "mobile", "contact number",
+        "telephone", "telephone number", "cell phone", "cell number",
+    ],
     "location": ["location", "current location", "city, state"],
     "city": ["city"],
     "state": ["state", "province"],
