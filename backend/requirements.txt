@@ -17,6 +17,7 @@ apscheduler>=3.10,<4.0
 pyjwt
 email-validator
 cryptography      # field-level encryption for candidate profile PII (phone, address)
+fastembed
 
 # --- Object storage (STORAGE_BACKEND=s3 — see app/services/storage/) ---
 boto3             # only actually connects to S3 when STORAGE_BACKEND=s3; harmless to install otherwise
