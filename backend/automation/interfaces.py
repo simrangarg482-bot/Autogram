@@ -61,13 +61,13 @@ from sqlalchemy.orm import Session
 # =============================================================================
 
 # --- database session --------------------------------------------------
-from app.core.database import SessionLocal, get_db  # noqa: F401  (get_db re-exported for FastAPI-context callers)
+from app.core.database import SessionLocal, get_db  
 
 # --- auth / user context -------------------------------------------------
-from app.core.auth import get_current_user  # noqa: F401
+from app.core.auth import get_current_user  
 
 # --- ORM models -----------------------------------------------------------
-from app.models.db_models import (  # noqa: F401
+from app.models.db_models import ( 
     CandidateDemographics,
     CandidateProfile,
     EducationEntry,
@@ -85,17 +85,17 @@ from app.models.db_models import (  # noqa: F401
 )
 
 # --- existing repositories / services -------------------------------
-from app.services import profile_repository  # noqa: F401
-from app.services import answer_cache_repository  # noqa: F401 — Phase 6 screening-question answer cache
-from app.services.document_storage import (  # noqa: F401
+from app.services import profile_repository  
+from app.services import answer_cache_repository  
+from app.services.document_storage import (  
     compute_file_hash,
     delete_document_file,
     save_document_file,
 )
 
 # --- existing AI layer ----------------------------------------------------
-from app.ai.llm.router import llm_router, LLMRouterError  # noqa: F401
-from app.services.embedding_service import generate_embedding  # noqa: F401
+from app.ai.llm.router import llm_router, LLMRouterError  
+from app.services.embedding_service import generate_embedding  
 
 
 @contextmanager
