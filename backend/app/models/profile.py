@@ -34,6 +34,7 @@ class ProfileUpsertRequest(BaseModel):
     state: str | None = None
     postal_code: str | None = None
     country: str | None = None
+    citizenship: str | None = None  # explicit citizenship; never inferred from residence country
     time_zone: str | None = None  # free text in the form's own words — "IST", "GMT+5:30", "US Eastern"
     linkedin_url: str | None = None
     github_url: str | None = None
@@ -104,6 +105,7 @@ class ProfileResponse(BaseModel):
     state: str | None = None
     postal_code: str | None = None
     country: str | None = None
+    citizenship: str | None = None
     time_zone: str | None = None
     linkedin_url: str | None = None
     github_url: str | None = None
